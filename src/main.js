@@ -31,8 +31,9 @@ const searchTerms = searchTermsInput
 const useDirectUrls = competitorUrls && competitorUrls.length > 0;
 
 console.log('🚀 Competitor Ads Scraper');
-console.log('🔖 VERSION: 2025-11-05-v3.9-NO-ENGAGEMENT - Removed engagement metrics (reactions/comments/shares)');
+console.log('🔖 VERSION: 2025-11-24-v4.0-JSON-FIRST - Extract all ads from JSON (130+) with DOM fallback (78)');
 console.log('✅ Code successfully loaded from GitHub');
+console.log('📝 Strategy: Try JSON extraction first (gets ALL ads), fallback to DOM scraping if needed');
 console.log('─────────────────────────────────────────────────────');
 if (useDirectUrls) {
     console.log(`📊 Mode: Direct competitor URLs (${competitorUrls.length} competitors)`);
@@ -160,24 +161,226 @@ const crawlerOptions = {
             }
             
             console.log('🕵️ Collecting all active ads...');
-            
+
             // Wait for ads to load - Facebook Ads Library takes time
-            console.log('⏳ Waiting for ads to load...');
+            console.log('⏳ Waiting for initial page load...');
             await new Promise(resolve => setTimeout(resolve, 5000));
-            
-            // Scroll more to load ALL ads (increased from 10 to 30)
-            await autoScroll(page, 30);
-            await new Promise(resolve => setTimeout(resolve, 5000));
-            
-            console.log('🔍 Checking page content...');
-            
-            // Collect ALL ads from the page (no filtering by quality)
-            const discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
+
+            // STEP 1: Try to extract JSON data from page source (gets ALL ads at once)
+            console.log('📊 Method 1: Extracting ads from embedded JSON data...');
+
+            let discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
                 const ads = [];
-                
-                console.log('🔍 Starting ad discovery in browser context...');
-                console.log('Page URL:', window.location.href);
-                console.log('Page title:', document.title);
+                const errors = [];
+
+                console.log('🔍 Searching for JSON data in page source...');
+
+                try {
+                    // Get all script tags
+                    const scripts = document.querySelectorAll('script');
+                    console.log(`Found ${scripts.length} script tags to search`);
+
+                    let jsonData = null;
+                    let foundInScript = false;
+
+                    // Search through scripts for the ad library data
+                    for (let i = 0; i < scripts.length; i++) {
+                        const script = scripts[i];
+                        const scriptContent = script.textContent || script.innerText || '';
+
+                        if (!scriptContent) continue;
+
+                        // Look for ad_library_main pattern
+                        if (scriptContent.includes('ad_library_main') &&
+                            scriptContent.includes('search_results_connection')) {
+
+                            console.log(`Found ad_library_main in script ${i}`);
+                            foundInScript = true;
+
+                            try {
+                                // Try to find the edges array with ads
+                                // Pattern: "edges":[{...}]
+                                const edgesPattern = /"edges"\s*:\s*\[/g;
+                                const matches = [];
+                                let match;
+
+                                while ((match = edgesPattern.exec(scriptContent)) !== null) {
+                                    matches.push(match.index);
+                                }
+
+                                console.log(`Found ${matches.length} potential "edges" arrays`);
+
+                                // Try to extract each edges array
+                                for (const startIdx of matches) {
+                                    try {
+                                        // Find the start of the edges array
+                                        const arrayStart = scriptContent.indexOf('[', startIdx);
+                                        if (arrayStart === -1) continue;
+
+                                        // Extract balanced array
+                                        let depth = 0;
+                                        let endIdx = -1;
+
+                                        for (let j = arrayStart; j < scriptContent.length; j++) {
+                                            if (scriptContent[j] === '[' || scriptContent[j] === '{') depth++;
+                                            if (scriptContent[j] === ']' || scriptContent[j] === '}') {
+                                                depth--;
+                                                if (depth === 0 && scriptContent[j] === ']') {
+                                                    endIdx = j + 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if (endIdx === -1) continue;
+
+                                        const arrayText = scriptContent.substring(arrayStart, endIdx);
+
+                                        // Try to parse
+                                        const parsedArray = JSON.parse(arrayText);
+
+                                        // Check if this looks like ad data (has nodes with ad properties)
+                                        if (Array.isArray(parsedArray) && parsedArray.length > 0) {
+                                            const firstItem = parsedArray[0];
+                                            if (firstItem && firstItem.node &&
+                                                (firstItem.node.page_name || firstItem.node.ad_archive_id)) {
+                                                console.log(`✅ Found valid ad edges array with ${parsedArray.length} items`);
+                                                jsonData = parsedArray;
+                                                break;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        // This edges array didn't work, try next
+                                        continue;
+                                    }
+                                }
+
+                                if (jsonData) break; // Found data, stop searching scripts
+
+                            } catch (err) {
+                                console.log('Error parsing script:', err.message);
+                            }
+                        }
+                    }
+
+                    // Process the JSON data if found
+                    if (jsonData && jsonData.length > 0) {
+                        console.log(`🎯 Processing ${jsonData.length} ads from JSON data...`);
+
+                        jsonData.forEach((edge, index) => {
+                            try {
+                                const node = edge.node;
+                                if (!node) return;
+
+                                // Extract ad data from JSON
+                                const ad = {
+                                    advertiserName: node.page_name || node.page_id || 'Unknown',
+                                    adText: '',
+                                    ctaButtonText: node.cta_text || '',
+                                    landingPageUrl: node.ad_snapshot_url || '',
+                                    adId: node.ad_archive_id || node.id || `json_${index}`,
+                                    images: [],
+                                    videos: [],
+                                    activeDays: 0,
+                                    platform: Array.isArray(node.publisher_platforms) ? node.publisher_platforms.join(', ') : '',
+                                    startDate: node.start_date || node.ad_delivery_start_time || '',
+                                    endDate: node.end_date || node.ad_delivery_stop_time || ''
+                                };
+
+                                // Extract ad text
+                                if (node.ad_creative_body) {
+                                    ad.adText = node.ad_creative_body;
+                                } else if (node.ad_creative_bodies && Array.isArray(node.ad_creative_bodies)) {
+                                    ad.adText = node.ad_creative_bodies.join(' ');
+                                }
+
+                                // Calculate active days
+                                if (ad.startDate) {
+                                    const start = new Date(ad.startDate);
+                                    const end = ad.endDate ? new Date(ad.endDate) : new Date();
+                                    ad.activeDays = Math.floor((end - start) / (1000 * 60 * 60 * 24));
+                                }
+
+                                // Extract images
+                                if (node.snapshot && node.snapshot.images) {
+                                    node.snapshot.images.forEach(img => {
+                                        const url = img.original_image_url || img.resized_image_url;
+                                        if (url) ad.images.push(url);
+                                    });
+                                }
+
+                                // Extract videos
+                                if (node.snapshot && node.snapshot.videos) {
+                                    node.snapshot.videos.forEach(vid => {
+                                        const url = vid.video_hd_url || vid.video_sd_url;
+                                        if (url) ad.videos.push(url);
+                                    });
+                                }
+
+                                // Only add if meets minimum days requirement
+                                if (ad.activeDays >= minDays && ad.advertiserName !== 'Unknown' && ad.adText) {
+                                    ads.push(ad);
+                                }
+
+                            } catch (err) {
+                                errors.push(`Error processing node ${index}: ${err.message}`);
+                            }
+                        });
+
+                        console.log(`✅ JSON extraction complete: ${ads.length} valid ads (from ${jsonData.length} total)`);
+
+                        return {
+                            ads: ads,
+                            errors: errors,
+                            method: 'json_extraction',
+                            success: true,
+                            totalFound: jsonData.length
+                        };
+                    } else {
+                        console.log('⚠️ No JSON ad data found in page source');
+                        if (foundInScript) {
+                            console.log('   Found ad_library_main but could not parse edges array');
+                        }
+                    }
+
+                } catch (error) {
+                    console.log('❌ JSON extraction error:', error.message);
+                    errors.push(error.message);
+                }
+
+                // Return failure so we can fall back to DOM scraping
+                return {
+                    ads: [],
+                    errors: errors,
+                    method: 'json_extraction',
+                    success: false,
+                    totalFound: 0
+                };
+
+            }, searchTerm, minActiveDays, competitorName || 'Unknown', searchUrl);
+
+            // Check if JSON extraction succeeded
+            if (discoveredAdsResult.success && discoveredAdsResult.ads.length > 0) {
+                console.log(`✅ JSON extraction successful! Found ${discoveredAdsResult.ads.length} ads`);
+                console.log(`   (Extracted from ${discoveredAdsResult.totalFound} total ads in JSON)`);
+            } else {
+                // STEP 2: Fall back to DOM scraping if JSON extraction failed
+                console.log('⚠️ JSON extraction failed or found no ads');
+                console.log('📜 Method 2: Falling back to DOM scraping...');
+                console.log('   Scrolling to load ads...');
+
+                // Scroll more to load ALL ads (increased from 10 to 30)
+                await autoScroll(page, 30);
+                await new Promise(resolve => setTimeout(resolve, 5000));
+
+                console.log('🔍 Scraping DOM elements...');
+
+                discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
+                    const ads = [];
+
+                    console.log('🔍 Starting ad discovery in browser context...');
+                    console.log('Page URL:', window.location.href);
+                    console.log('Page title:', document.title);
                 
                 // Check for different possible ad containers
                 const testSelectors = {
@@ -912,6 +1115,9 @@ const crawlerOptions = {
                 // Return both ads and debug info
                 return {
                     ads: ads.slice(0, 100), // Limit to 100 ads per competitor
+                    method: 'dom_scraping',
+                    success: true,
+                    totalFound: ads.length,
                     debug: {
                         selectorCounts: testSelectors,
                         totalContainers: allContainers.length,
@@ -924,20 +1130,31 @@ const crawlerOptions = {
                         pageTitle: document.title
                     }
                 };
-                
-            }, searchTerm, minActiveDays, competitorName, directUrl);
+
+                }, searchTerm, minActiveDays, competitorName, directUrl);
+            }
+
+            // Log results (works for both JSON and DOM methods)
+            console.log('📊 Scraping Results:');
+            console.log(`   Method used: ${discoveredAdsResult.method}`);
+            console.log(`   Success: ${discoveredAdsResult.success}`);
+            console.log(`   Ads found: ${discoveredAdsResult.ads.length}`);
+
+            // Log debug info if available (DOM scraping provides this)
+            if (discoveredAdsResult.debug) {
+                console.log('\n📊 Debug Info from Browser:');
+                console.log(`   URL: ${discoveredAdsResult.debug.pageUrl}`);
+                console.log(`   Title: ${discoveredAdsResult.debug.pageTitle}`);
+                console.log(`   Selector counts:`, JSON.stringify(discoveredAdsResult.debug.selectorCounts));
+                console.log(`   Total containers checked: ${discoveredAdsResult.debug.totalContainers}`);
+                console.log(`   Potential ad containers: ${discoveredAdsResult.debug.potentialAdContainers}`);
+            }
             
-            // Log debug info from browser
-            console.log('📊 Debug Info from Browser:');
-            console.log(`   URL: ${discoveredAdsResult.debug.pageUrl}`);
-            console.log(`   Title: ${discoveredAdsResult.debug.pageTitle}`);
-            console.log(`   Selector counts:`, JSON.stringify(discoveredAdsResult.debug.selectorCounts));
-            console.log(`   Total containers checked: ${discoveredAdsResult.debug.totalContainers}`);
-            console.log(`   Potential ad containers: ${discoveredAdsResult.debug.potentialAdContainers}`);
-            
-            // Log first 3 sample extractions
-            console.log('\n🔬 Sample Extractions (first 3 containers):');
-            if (discoveredAdsResult.debug.debugSamples && discoveredAdsResult.debug.debugSamples.length > 0) {
+            // Log first 3 sample extractions (only for DOM scraping)
+            if (discoveredAdsResult.debug && discoveredAdsResult.debug.debugSamples) {
+                console.log('\n🔬 Sample Extractions (first 3 containers):');
+            }
+            if (discoveredAdsResult.debug && discoveredAdsResult.debug.debugSamples && discoveredAdsResult.debug.debugSamples.length > 0) {
                 discoveredAdsResult.debug.debugSamples.forEach(sample => {
                     console.log(`\n  Container ${sample.index}:`);
                     console.log(`    Advertiser: "${sample.advertiser}"`);
@@ -955,23 +1172,25 @@ const crawlerOptions = {
             } else {
                 console.log('  No samples available');
             }
-            
-            console.log('\n📊 Rejection Summary:');
-            if (discoveredAdsResult.debug.rejectionReasons && Object.keys(discoveredAdsResult.debug.rejectionReasons).length > 0) {
-                Object.entries(discoveredAdsResult.debug.rejectionReasons).forEach(([reason, count]) => {
-                    console.log(`  ${reason}: ${count}`);
-                });
-            } else {
-                console.log('  No rejection data available');
-            }
-            
-            // Log errors if any
-            if (discoveredAdsResult.debug.totalErrors > 0) {
-                console.log(`\n❌ Errors during extraction: ${discoveredAdsResult.debug.totalErrors}`);
-                if (discoveredAdsResult.debug.errors && discoveredAdsResult.debug.errors.length > 0) {
-                    discoveredAdsResult.debug.errors.forEach(err => {
-                        console.log(`  Container ${err.index}: ${err.message}`);
+
+            if (discoveredAdsResult.debug) {
+                console.log('\n📊 Rejection Summary:');
+                if (discoveredAdsResult.debug.rejectionReasons && Object.keys(discoveredAdsResult.debug.rejectionReasons).length > 0) {
+                    Object.entries(discoveredAdsResult.debug.rejectionReasons).forEach(([reason, count]) => {
+                        console.log(`  ${reason}: ${count}`);
                     });
+                } else {
+                    console.log('  No rejection data available');
+                }
+
+                // Log errors if any
+                if (discoveredAdsResult.debug.totalErrors > 0) {
+                    console.log(`\n❌ Errors during extraction: ${discoveredAdsResult.debug.totalErrors}`);
+                    if (discoveredAdsResult.debug.errors && discoveredAdsResult.debug.errors.length > 0) {
+                        discoveredAdsResult.debug.errors.forEach(err => {
+                            console.log(`  Container ${err.index}: ${err.message}`);
+                        });
+                    }
                 }
             }
             
