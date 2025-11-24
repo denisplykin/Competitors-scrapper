@@ -1,6 +1,6 @@
 import { Actor } from 'apify';
 import { PuppeteerCrawler } from 'crawlee';
-import { google } from 'googleapis';
+// googleapis imported dynamically when needed (only if enableGoogleSheets is true)
 
 await Actor.init();
 
@@ -2094,17 +2094,22 @@ async function matchAdsToOrganicPosts(ads, organicPosts) {
 async function exportToGoogleSheetsByCompetitor(adsByCompetitor, spreadsheetId, serviceAccountKey) {
     try {
         console.log('📊 Starting export to Google Sheets (separate sheets per competitor)...');
-        
+
         if (!serviceAccountKey || !spreadsheetId) {
             console.log('⚠️ Google Sheets credentials not provided. Skipping export.');
             return false;
         }
 
+        // Dynamically import googleapis (only when needed)
+        console.log('📦 Loading googleapis module...');
+        const { google } = await import('googleapis');
+        console.log('✅ googleapis module loaded successfully');
+
         // Parse service account key
         let credentials;
         try {
-            credentials = typeof serviceAccountKey === 'string' 
-                ? JSON.parse(serviceAccountKey) 
+            credentials = typeof serviceAccountKey === 'string'
+                ? JSON.parse(serviceAccountKey)
                 : serviceAccountKey;
         } catch (e) {
             console.error('❌ Invalid Service Account JSON:', e.message);
