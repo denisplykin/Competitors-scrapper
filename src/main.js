@@ -384,7 +384,7 @@ const crawlerOptions = {
                     success: false
                 };
 
-            }, searchTerm, minActiveDays, competitorName || 'Unknown', url);
+            }, searchTerm, minActiveDays, competitorName || 'Unknown', searchUrl);
 
             // If JSON extraction succeeded, use that data
             if (discoveredAdsResult.success && discoveredAdsResult.ads.length > 0) {
