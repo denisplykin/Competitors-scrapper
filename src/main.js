@@ -2102,8 +2102,16 @@ async function exportToGoogleSheetsByCompetitor(adsByCompetitor, spreadsheetId, 
 
         // Dynamically import googleapis (only when needed)
         console.log('📦 Loading googleapis module...');
-        const { google } = await import('googleapis');
-        console.log('✅ googleapis module loaded successfully');
+        let google;
+        try {
+            const imported = await import('googleapis');
+            google = imported.google;
+            console.log('✅ googleapis module loaded successfully');
+        } catch (importError) {
+            console.error('❌ Failed to load googleapis module:', importError.message);
+            console.error('   Make sure googleapis is installed: npm install googleapis');
+            return false;
+        }
 
         // Parse service account key
         let credentials;

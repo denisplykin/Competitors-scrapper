@@ -3,7 +3,7 @@
     "name": "algonova-competitor-scraper-v2",
     "title": "Project Puppeteer Crawler JavaScript",
     "description": "Crawlee and Puppeteer project in JavaScript.",
-    "version": "0.0",
+    "version": "1.0.1",
     "meta": {
         "templateId": "js-crawlee-puppeteer-chrome"
     },

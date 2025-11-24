@@ -1,6 +1,7 @@
 # Specify the base Docker image. You can read more about
 # the available images at https://crawlee.dev/docs/guides/docker-images
 # You can also use any other image from Docker Hub.
+# Version: 1.0.1 - Updated 2025-11-24 - Fixed googleapis import
 FROM apify/actor-node-puppeteer-chrome:22-24.12.1
 
 # Check preinstalled packages
