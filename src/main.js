@@ -1,6 +1,6 @@
 import { Actor } from 'apify';
 import { PuppeteerCrawler } from 'crawlee';
-import { google } from 'googleapis';
+// googleapis imported dynamically when needed (see exportToGoogleSheetsByCompetitor function)
 
 await Actor.init();
 
@@ -2075,11 +2075,24 @@ async function exportToGoogleSheetsByCompetitor(adsByCompetitor, spreadsheetId, 
             return false;
         }
 
+        // Dynamically import googleapis (only when needed)
+        console.log('📦 Loading googleapis module...');
+        let google;
+        try {
+            const imported = await import('googleapis');
+            google = imported.google;
+            console.log('✅ googleapis module loaded successfully');
+        } catch (importError) {
+            console.error('❌ Failed to load googleapis module:', importError.message);
+            console.error('   Make sure googleapis is installed: npm install googleapis');
+            return false;
+        }
+
         // Parse service account key
         let credentials;
         try {
-            credentials = typeof serviceAccountKey === 'string' 
-                ? JSON.parse(serviceAccountKey) 
+            credentials = typeof serviceAccountKey === 'string'
+                ? JSON.parse(serviceAccountKey)
                 : serviceAccountKey;
         } catch (e) {
             console.error('❌ Invalid Service Account JSON:', e.message);
