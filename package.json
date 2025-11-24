@@ -1,11 +1,11 @@
 {
     "name": "algonova-competitor-scraper",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "type": "module",
     "description": "Facebook Ads Library scraper for Algonova EdTech competitor analysis",
     "main": "src/main.js",
-    "engines": { 
-        "node": ">=18.0.0" 
+    "engines": {
+        "node": ">=18.0.0"
     },
     "dependencies": {
         "apify": "^3.4.2",
@@ -13,8 +13,8 @@
         "puppeteer": "24.12.1",
         "googleapis": "^128.0.0"
     },
-    "scripts": { 
-        "start": "node ./src/main.js" 
+    "scripts": {
+        "start": "node ./src/main.js"
     },
     "author": "Algonova Team",
     "license": "ISC"
