@@ -291,6 +291,11 @@ const crawlerOptions = {
             await autoScroll(page, targetScrolls);
             await new Promise(resolve => setTimeout(resolve, 5000));
             
+            // Save HTML for debugging
+            const html = await page.content();
+            await Actor.setValue('PAGE_CONTENT.html', html, { contentType: 'text/html' });
+            console.log('📄 Page HTML saved to Key-Value Store as PAGE_CONTENT.html');
+
             console.log('🔍 Checking page content...');
             
             // Collect ALL ads from the page (no filtering by quality)
@@ -1497,36 +1502,20 @@ const crawlerOptions = {
                 
                 function isValidAdMedia(url) {
                     if (!url || url.includes('data:image')) return false;
-                    
-                    // ⚠️ Исключаем логотипы/аватары/профили ДЛЯ ВСЕХ URL (включая Facebook CDN!)
-                    const logoPatterns = [
-                        'favicon', '/images/emoji/', 'spinner', 'icon-',
-                        'profile_pic', 'avatar', 'logo', 'button',
-                        '_thumb_', // Миниатюры профилей
-                        /p\d{2,3}x\d{2,3}/, // Паттерн p200x200 = profile picture (до p999x999)
-                        /_s\d{1,2}x\d{1,2}[_\.]/, // ✅ Паттерн _s60x60_ или _s60x60. (profile thumbnails)
-                        /[=_]s\d{1,2}x\d{1,2}[_&\.]/ // ✅ Паттерн =s60x60_ или _s60x60& (query params)
-                    ];
-                    
-                    const hasLogoPattern = logoPatterns.some(pattern => {
-                        if (pattern instanceof RegExp) {
-                            return pattern.test(url);
-                        }
-                        return url.includes(pattern);
-                    });
-                    
-                    if (hasLogoPattern) {
-                        return false; // ❌ Исключаем логотипы/аватары даже с Facebook CDN
+
+                    // ✅ Looser filtering: only reject obvious UI elements
+                    const rejectPatterns = ['favicon', '/images/emoji/', 'spinner', 'icon-'];
+                    if (rejectPatterns.some(p => url.includes(p))) {
+                        return false;
                     }
-                    
-                    // ✅ Приоритет для scontent/fbcdn - это рекламные изображения
-                    const isFacebookCDN = url.includes('scontent') || url.includes('fbcdn') || url.includes('external');
-                    if (isFacebookCDN) {
-                        return true; // ✅ Принимаем Facebook CDN (после проверки на логотипы)
+
+                    // ✅ Accept all images from Facebook's CDN, as they are likely ad creatives
+                    if (url.includes('scontent') || url.includes('fbcdn')) {
+                        return true;
                     }
-                    
-                    // ⚠️ Для остальных URL - минимальная длина
-                    return url.length > 40;
+
+                    // For other URLs, check for a reasonable length
+                    return url.length > 50;
                 }
                 
                 function determineImageType(width, height) {
@@ -1967,6 +1956,7 @@ async function autoScroll(page, maxScrolls = 15) {
                 await new Promise(resolve => setTimeout(resolve, 3000));
                 noNewAdsCounter = 0; // Reset counter after clicking button
             } else {
+                if (newAdsFound === 0 && scrollResult.newScroll === beforeScroll.oldScroll) {
                  if (newAdsFound === 0) {
                     noNewAdsCounter++;
                 } else {
@@ -1976,6 +1966,12 @@ async function autoScroll(page, maxScrolls = 15) {
             
             previousAdCount = scrollResult.currentAdCount;
 
+            if (noNewAdsCounter >= 3) {
+                console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads and scroll position stable for 3 consecutive scrolls)`);
+                break;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 4000));
             if (noNewAdsCounter >= 5) {
                 console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads for 5 consecutive scrolls)`);
                 break;
