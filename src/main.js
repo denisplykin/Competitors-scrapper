@@ -295,7 +295,97 @@ const crawlerOptions = {
             
             // Collect ALL ads from the page (no filtering by quality)
             const discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
-                const ads = [];
+                function extractAdsFromJSON() {
+                    const extractedAds = [];
+                    try {
+                        const edges = require[0][3][0].__bbox.require[0][3][1].__bbox.result.data.ad_library_main.search_results_connection.edges;
+
+                        if (edges && Array.isArray(edges)) {
+                            console.log(`Found ${edges.length} ad edges in JSON data.`);
+
+                            for (const edge of edges) {
+                                const node = edge.node;
+                                if (!node || !node.ad_snapshot) continue;
+
+                                const snapshot = node.ad_snapshot;
+                                const creative = node.ad_creative;
+
+                                const adText = creative?.body?.markup?.__html || snapshot?.body?.markup?.__html || '';
+                                const advertiserName = snapshot.page?.name;
+                                const adId = snapshot.ad_library_id;
+
+                                const mediaAssets = {
+                                    images: (snapshot.images || []).map(img => ({ url: img.original_image_url, width: img.width, height: img.height })),
+                                    videos: (snapshot.videos || []).map(vid => ({ videoUrl: vid.video_hd_url || vid.video_sd_url, thumbnailUrl: vid.thumbnail_url })),
+                                    thumbnails: (snapshot.videos || []).map(vid => ({ url: vid.thumbnail_url }))
+                                };
+
+                                const landingPageUrl = snapshot.link_url;
+                                const ctaButtonText = creative?.link_description || snapshot?.call_to_action_text || '';
+
+                                let activeDays = 1;
+                                if (snapshot.start_date) {
+                                     const startDate = new Date(snapshot.start_date * 1000);
+                                     const diffTime = Math.abs(new Date() - startDate);
+                                     activeDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+                                }
+
+                                if (advertiserName && adText && adId) {
+                                     extractedAds.push({
+                                        adId: adId,
+                                        libraryId: adId,
+                                        advertiserName: advertiserName,
+                                        adText: adText.replace(/<[^>]*>/g, ''), // Strip HTML tags
+                                        landingPageUrl: landingPageUrl || '',
+                                        ctaButtonText: ctaButtonText || '',
+                                        mediaAssets: mediaAssets,
+                                         visualSummary: {
+                                            totalImages: mediaAssets.images.length,
+                                            totalVideos: mediaAssets.videos.length,
+                                            totalThumbnails: mediaAssets.thumbnails.length,
+                                            hasCarousel: mediaAssets.images.length > 1,
+                                            hasVideo: mediaAssets.videos.length > 0,
+                                            hasHighResImages: mediaAssets.images.some(img => (img.width || 0) >= 400 && (img.height || 0) >= 400),
+                                        },
+                                        activeDays: activeDays,
+                                        searchTerm: searchTermParam,
+                                        competitorName: competitorName || searchTermParam,
+                                        discoveryMethod: 'json_extraction',
+                                        scrapedAt: new Date().toISOString(),
+                                        allImageUrls: mediaAssets.images.map(i => i.url),
+                                        allVideoUrls: mediaAssets.videos.map(v => v.videoUrl),
+                                        allThumbnailUrls: mediaAssets.thumbnails.map(t => t.url)
+                                     });
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.log('Error extracting ads from JSON:', e.message);
+                    }
+                    return extractedAds;
+                }
+
+                let ads = extractAdsFromJSON();
+                if (ads.length > 0) {
+                     console.log(`✅ Successfully extracted ${ads.length} ads using JSON method.`);
+                     return {
+                         ads,
+                         debug: {
+                             pageUrl: window.location.href,
+                             pageTitle: document.title,
+                             selectorCounts: {},
+                             totalContainers: 0,
+                             potentialAdContainers: 0,
+                             debugSamples: [],
+                             rejectionReasons: {},
+                             totalErrors: 0,
+                             errors: []
+                         }
+                     };
+                }
+
+                console.log('JSON extraction failed, falling back to DOM scraping.');
+                ads = [];
                 
                 console.log('🔍 Starting ad discovery in browser context...');
                 console.log('Page URL:', window.location.href);
@@ -1831,122 +1921,73 @@ async function autoScroll(page, maxScrolls = 15) {
         const { KeyValueStore } = await import('apify');
         console.log(`📜 Starting scroll: will perform ${maxScrolls} scrolls (6 seconds each)`);
         console.log(`📸 Screenshots will be saved to Key-Value Store`);
-        
-        // ✅ АКТИВИРУЕМ СТРАНИЦУ: кликаем на body для фокуса (обязательно для keyboard events!)
+
         console.log(`🖱️  Clicking on page to activate focus...`);
         await page.click('body');
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Пауза после клика
+        await new Promise(resolve => setTimeout(resolve, 1000));
         console.log(`✅ Page activated, ready to scroll`);
-        
+
         let previousAdCount = 0;
         let noNewAdsCounter = 0;
-        
+
         for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex++) {
-            // 📸 Скриншот ПЕРЕД скроллом
-            try {
-                const screenshot = await page.screenshot({ 
-                    fullPage: false, // Только видимая область (быстрее)
-                    encoding: 'binary'
-                });
-                
-                // Сохраняем в Apify Key-Value Store
-                await KeyValueStore.setValue(`scroll_${scrollIndex + 1}_before.png`, screenshot, { contentType: 'image/png' });
-                console.log(`📸 Screenshot saved: scroll_${scrollIndex + 1}_before.png`);
-            } catch (screenshotError) {
-                console.log(`⚠️ Screenshot failed: ${screenshotError.message}`);
-            }
-            
-            // 📊 Получаем статистику ДО скролла
-            const beforeScroll = await page.evaluate(() => {
-                return {
-                    oldHeight: document.body.scrollHeight,
-                    oldScroll: window.scrollY,
-                    adCards: Array.from(document.querySelectorAll('div')).filter(div => {
-                        const text = div.textContent || '';
-                        return text.includes('Sponsored') && 
-                               text.includes('Started running') &&
-                               div.querySelector('img') &&
-                               text.length > 100;
-                    }).length
-                };
-            });
-            
-            console.log(`[Before] scrollY=${beforeScroll.oldScroll}, height=${beforeScroll.oldHeight}, cards=${beforeScroll.adCards}`);
-            
-            // ✅ СКРОЛЛИМ ЧЕРЕЗ KEYBOARD (обходит детекцию ботов!)
-            // Симулируем реального пользователя нажимающего Page Down
+            const beforeScroll = await page.evaluate(() => ({
+                oldHeight: document.body.scrollHeight,
+                oldScroll: window.scrollY,
+                adCards: document.querySelectorAll('[data-testid*="ad"]').length
+            }));
+
+            console.log(`[Before] scrollY=${beforeScroll.oldScroll}, height=${beforeScroll.oldHeight}, ads=${beforeScroll.adCards}`);
+
+            // New scrolling strategy
+            await page.keyboard.press('End');
+            await new Promise(resolve => setTimeout(resolve, 1000));
             await page.keyboard.press('PageDown');
-            await new Promise(resolve => setTimeout(resolve, 500)); // Пауза после нажатия
-            
-            // 📊 Получаем статистику ПОСЛЕ скролла
-            const scrollResult = await page.evaluate(() => {
-                const newHeight = document.body.scrollHeight;
-                const newScroll = window.scrollY;
-                
-                const adCards = Array.from(document.querySelectorAll('div')).filter(div => {
-                    const text = div.textContent || '';
-                    return text.includes('Sponsored') && 
-                           text.includes('Started running') &&
-                           div.querySelector('img') &&
-                           text.length > 100;
-                }).length;
-                
-                return {
-                    oldHeight: null, // Заполним из beforeScroll
-                    newHeight,
-                    oldScroll: null, // Заполним из beforeScroll
-                    newScroll,
-                    currentAdCount: adCards
-                };
-            });
-            
-            // Копируем значения из beforeScroll
-            scrollResult.oldHeight = beforeScroll.oldHeight;
-            scrollResult.oldScroll = beforeScroll.oldScroll;
-            
-            console.log(`[After] scrollY=${scrollResult.newScroll}, height=${scrollResult.newHeight}, cards=${scrollResult.currentAdCount}`);
+            await new Promise(resolve => setTimeout(resolve, 1500));
+
+            const scrollResult = await page.evaluate(() => ({
+                newHeight: document.body.scrollHeight,
+                newScroll: window.scrollY,
+                currentAdCount: document.querySelectorAll('[data-testid*="ad"]').length
+            }));
             
             const newAdsFound = scrollResult.currentAdCount - previousAdCount;
-            
-            console.log(`📜 Scroll ${scrollIndex + 1}/${maxScrolls}: ${scrollResult.oldHeight}px → ${scrollResult.newHeight}px | Scroll: ${scrollResult.oldScroll}px → ${scrollResult.newScroll}px | Ad cards found: ${scrollResult.currentAdCount} (+${newAdsFound})`);
-            
-            // Проверяем, загружается ли новый контент
-            if (newAdsFound === 0) {
-                noNewAdsCounter++;
+            console.log(`📜 Scroll ${scrollIndex + 1}/${maxScrolls}: Height: ${beforeScroll.oldHeight}px -> ${scrollResult.newHeight}px | Scroll: ${beforeScroll.oldScroll}px -> ${scrollResult.newScroll}px | Ads found: ${scrollResult.currentAdCount} (+${newAdsFound})`);
+
+            // Check for a "show more" or "see more" button
+            const moreButton = await page.evaluateHandle(() => {
+                const buttons = Array.from(document.querySelectorAll('div[role="button"], button'));
+                const moreButtonTexts = ['see more results', 'show more', 'view more', 'lihat lainnya', 'tampilkan lebih banyak'];
+                return buttons.find(button => moreButtonTexts.some(text => button.innerText.toLowerCase().includes(text)));
+            });
+
+            if (moreButton && (await moreButton.boundingBox())) {
+                console.log('🖱️ Clicking "show more" button...');
+                await moreButton.click();
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                noNewAdsCounter = 0; // Reset counter after clicking button
             } else {
-                noNewAdsCounter = 0;
+                 if (newAdsFound === 0) {
+                    noNewAdsCounter++;
+                } else {
+                    noNewAdsCounter = 0;
+                }
             }
-            previousAdCount = scrollResult.currentAdCount;
             
-            // ✅ Завершаем если 5 скроллов подряд без новых объявлений (увеличено с 3 до 5)
+            previousAdCount = scrollResult.currentAdCount;
+
             if (noNewAdsCounter >= 5) {
-                console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads loaded for 5 consecutive scrolls)`);
-                console.log(`   Final stats: height ${scrollResult.newHeight}px, Ad cards found: ${scrollResult.currentAdCount}`);
+                console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads for 5 consecutive scrolls)`);
                 break;
             }
-            
-            // Пауза между скроллами для загрузки lazy-loaded контента
+
             await new Promise(resolve => setTimeout(resolve, 6000));
         }
-        
-        // 📸 Финальный скриншот
-        try {
-            const { KeyValueStore } = await import('apify');
-            const finalScreenshot = await page.screenshot({ 
-                fullPage: false,
-                encoding: 'binary'
-            });
-            await KeyValueStore.setValue('scroll_final.png', finalScreenshot, { contentType: 'image/png' });
-            console.log(`📸 Final screenshot saved: scroll_final.png`);
-        } catch (screenshotError) {
-            console.log(`⚠️ Final screenshot failed: ${screenshotError.message}`);
-        }
-        
-        // ✅ Дополнительная пауза после всех скроллов
+
         console.log('⏳ Waiting additional 10 seconds for final content to load...');
         await new Promise(resolve => setTimeout(resolve, 10000));
         console.log('✅ Final wait complete');
-        
+
     } catch (error) {
         console.error('❌ Error during scrolling:', error.message);
     }
