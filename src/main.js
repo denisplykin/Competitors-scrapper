@@ -1,6 +1,29 @@
 import { Actor } from 'apify';
 import { PuppeteerCrawler } from 'crawlee';
 import { google } from 'googleapis';
+import { createClient } from '@supabase/supabase-js';
+import { readFileSync } from 'fs';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
+
+// Load environment variables from .env file (for local development)
+try {
+    const __filename = fileURLToPath(import.meta.url);
+    const __dirname = dirname(__filename);
+    const envPath = join(__dirname, '..', '.env');
+    const envContent = readFileSync(envPath, 'utf8');
+    envContent.split('\n').forEach(line => {
+        const [key, ...valueParts] = line.split('=');
+        if (key && valueParts.length > 0) {
+            const value = valueParts.join('=').trim().replace(/^["']|["']$/g, '');
+            if (!process.env[key.trim()]) {
+                process.env[key.trim()] = value;
+            }
+        }
+    });
+} catch (e) {
+    // .env file not found, use environment variables or input
+}
 
 await Actor.init();
 
@@ -10,15 +33,18 @@ const {
     competitorUrls = [],
     country = 'ID',
     maxPages = 10,
-    minActiveDays = 7,
+    minActiveDays = 1,
     useProxy = false,
     saveMediaAssets = true,
     highResolutionOnly = true,
     enableEngagementMatching = false,
     enableGoogleSheets = false,
-    googleSheetsSpreadsheetId = '',
-    googleSheetsName = 'Competitor Ads',
-    googleServiceAccountKey = ''
+    googleSheetsSpreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID || '',
+    googleSheetsName = process.env.GOOGLE_SHEETS_NAME || 'Competitor Ads',
+    googleServiceAccountKey = '',
+    enableSupabase = process.env.SUPABASE_URL ? true : false,
+    supabaseUrl = process.env.SUPABASE_URL || '',
+    supabaseKey = process.env.SUPABASE_KEY || ''
 } = input ?? {};
 
 // Parse search terms (fallback if no competitorUrls provided)
@@ -31,9 +57,8 @@ const searchTerms = searchTermsInput
 const useDirectUrls = competitorUrls && competitorUrls.length > 0;
 
 console.log('🚀 Competitor Ads Scraper');
-console.log('🔖 VERSION: 2025-11-24-v4.0-JSON-FIRST - Extract all ads from JSON (130+) with DOM fallback (78)');
+console.log('🔖 VERSION: 2025-11-05-v3.9-NO-ENGAGEMENT - Removed engagement metrics (reactions/comments/shares)');
 console.log('✅ Code successfully loaded from GitHub');
-console.log('📝 Strategy: Try JSON extraction first (gets ALL ads), fallback to DOM scraping if needed');
 console.log('─────────────────────────────────────────────────────');
 if (useDirectUrls) {
     console.log(`📊 Mode: Direct competitor URLs (${competitorUrls.length} competitors)`);
@@ -64,6 +89,7 @@ const crawlerOptions = {
     launchContext: {
         launchOptions: {
             headless: true,
+            protocolTimeout: 900000, // ✅ 15 минут вместо 3 минут по умолчанию (для длинного скроллинга)
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox',
@@ -161,226 +187,169 @@ const crawlerOptions = {
             }
             
             console.log('🕵️ Collecting all active ads...');
-
+            
             // Wait for ads to load - Facebook Ads Library takes time
-            console.log('⏳ Waiting for initial page load...');
+            console.log('⏳ Waiting for ads to load...');
             await new Promise(resolve => setTimeout(resolve, 5000));
-
-            // STEP 1: Try to extract JSON data from page source (gets ALL ads at once)
-            console.log('📊 Method 1: Extracting ads from embedded JSON data...');
-
-            let discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
-                const ads = [];
-                const errors = [];
-
-                console.log('🔍 Searching for JSON data in page source...');
-
-                try {
-                    // Get all script tags
-                    const scripts = document.querySelectorAll('script');
-                    console.log(`Found ${scripts.length} script tags to search`);
-
-                    let jsonData = null;
-                    let foundInScript = false;
-
-                    // Search through scripts for the ad library data
-                    for (let i = 0; i < scripts.length; i++) {
-                        const script = scripts[i];
-                        const scriptContent = script.textContent || script.innerText || '';
-
-                        if (!scriptContent) continue;
-
-                        // Look for ad_library_main pattern
-                        if (scriptContent.includes('ad_library_main') &&
-                            scriptContent.includes('search_results_connection')) {
-
-                            console.log(`Found ad_library_main in script ${i}`);
-                            foundInScript = true;
-
-                            try {
-                                // Try to find the edges array with ads
-                                // Pattern: "edges":[{...}]
-                                const edgesPattern = /"edges"\s*:\s*\[/g;
-                                const matches = [];
-                                let match;
-
-                                while ((match = edgesPattern.exec(scriptContent)) !== null) {
-                                    matches.push(match.index);
-                                }
-
-                                console.log(`Found ${matches.length} potential "edges" arrays`);
-
-                                // Try to extract each edges array
-                                for (const startIdx of matches) {
-                                    try {
-                                        // Find the start of the edges array
-                                        const arrayStart = scriptContent.indexOf('[', startIdx);
-                                        if (arrayStart === -1) continue;
-
-                                        // Extract balanced array
-                                        let depth = 0;
-                                        let endIdx = -1;
-
-                                        for (let j = arrayStart; j < scriptContent.length; j++) {
-                                            if (scriptContent[j] === '[' || scriptContent[j] === '{') depth++;
-                                            if (scriptContent[j] === ']' || scriptContent[j] === '}') {
-                                                depth--;
-                                                if (depth === 0 && scriptContent[j] === ']') {
-                                                    endIdx = j + 1;
-                                                    break;
-                                                }
-                                            }
-                                        }
-
-                                        if (endIdx === -1) continue;
-
-                                        const arrayText = scriptContent.substring(arrayStart, endIdx);
-
-                                        // Try to parse
-                                        const parsedArray = JSON.parse(arrayText);
-
-                                        // Check if this looks like ad data (has nodes with ad properties)
-                                        if (Array.isArray(parsedArray) && parsedArray.length > 0) {
-                                            const firstItem = parsedArray[0];
-                                            if (firstItem && firstItem.node &&
-                                                (firstItem.node.page_name || firstItem.node.ad_archive_id)) {
-                                                console.log(`✅ Found valid ad edges array with ${parsedArray.length} items`);
-                                                jsonData = parsedArray;
-                                                break;
-                                            }
-                                        }
-                                    } catch (e) {
-                                        // This edges array didn't work, try next
-                                        continue;
-                                    }
-                                }
-
-                                if (jsonData) break; // Found data, stop searching scripts
-
-                            } catch (err) {
-                                console.log('Error parsing script:', err.message);
-                            }
-                        }
-                    }
-
-                    // Process the JSON data if found
-                    if (jsonData && jsonData.length > 0) {
-                        console.log(`🎯 Processing ${jsonData.length} ads from JSON data...`);
-
-                        jsonData.forEach((edge, index) => {
-                            try {
-                                const node = edge.node;
-                                if (!node) return;
-
-                                // Extract ad data from JSON
-                                const ad = {
-                                    advertiserName: node.page_name || node.page_id || 'Unknown',
-                                    adText: '',
-                                    ctaButtonText: node.cta_text || '',
-                                    landingPageUrl: node.ad_snapshot_url || '',
-                                    adId: node.ad_archive_id || node.id || `json_${index}`,
-                                    images: [],
-                                    videos: [],
-                                    activeDays: 0,
-                                    platform: Array.isArray(node.publisher_platforms) ? node.publisher_platforms.join(', ') : '',
-                                    startDate: node.start_date || node.ad_delivery_start_time || '',
-                                    endDate: node.end_date || node.ad_delivery_stop_time || ''
-                                };
-
-                                // Extract ad text
-                                if (node.ad_creative_body) {
-                                    ad.adText = node.ad_creative_body;
-                                } else if (node.ad_creative_bodies && Array.isArray(node.ad_creative_bodies)) {
-                                    ad.adText = node.ad_creative_bodies.join(' ');
-                                }
-
-                                // Calculate active days
-                                if (ad.startDate) {
-                                    const start = new Date(ad.startDate);
-                                    const end = ad.endDate ? new Date(ad.endDate) : new Date();
-                                    ad.activeDays = Math.floor((end - start) / (1000 * 60 * 60 * 24));
-                                }
-
-                                // Extract images
-                                if (node.snapshot && node.snapshot.images) {
-                                    node.snapshot.images.forEach(img => {
-                                        const url = img.original_image_url || img.resized_image_url;
-                                        if (url) ad.images.push(url);
-                                    });
-                                }
-
-                                // Extract videos
-                                if (node.snapshot && node.snapshot.videos) {
-                                    node.snapshot.videos.forEach(vid => {
-                                        const url = vid.video_hd_url || vid.video_sd_url;
-                                        if (url) ad.videos.push(url);
-                                    });
-                                }
-
-                                // Only add if meets minimum days requirement
-                                if (ad.activeDays >= minDays && ad.advertiserName !== 'Unknown' && ad.adText) {
-                                    ads.push(ad);
-                                }
-
-                            } catch (err) {
-                                errors.push(`Error processing node ${index}: ${err.message}`);
-                            }
-                        });
-
-                        console.log(`✅ JSON extraction complete: ${ads.length} valid ads (from ${jsonData.length} total)`);
-
-                        return {
-                            ads: ads,
-                            errors: errors,
-                            method: 'json_extraction',
-                            success: true,
-                            totalFound: jsonData.length
-                        };
-                    } else {
-                        console.log('⚠️ No JSON ad data found in page source');
-                        if (foundInScript) {
-                            console.log('   Found ad_library_main but could not parse edges array');
-                        }
-                    }
-
-                } catch (error) {
-                    console.log('❌ JSON extraction error:', error.message);
-                    errors.push(error.message);
-                }
-
-                // Return failure so we can fall back to DOM scraping
+            
+            // 🔍 Проверяем состояние страницы перед скроллингом
+            const pageDebugInfo = await page.evaluate(() => {
                 return {
-                    ads: [],
-                    errors: errors,
-                    method: 'json_extraction',
-                    success: false,
-                    totalFound: 0
+                    bodyScrollHeight: document.body.scrollHeight,
+                    bodyOffsetHeight: document.body.offsetHeight,
+                    documentHeight: document.documentElement.scrollHeight,
+                    currentScroll: window.scrollY,
+                    bodyOverflow: getComputedStyle(document.body).overflow,
+                    htmlOverflow: getComputedStyle(document.documentElement).overflow,
+                    visibleText: document.body.innerText.substring(0, 500)
                 };
-
-            }, searchTerm, minActiveDays, competitorName || 'Unknown', searchUrl);
-
-            // Check if JSON extraction succeeded
-            if (discoveredAdsResult.success && discoveredAdsResult.ads.length > 0) {
-                console.log(`✅ JSON extraction successful! Found ${discoveredAdsResult.ads.length} ads`);
-                console.log(`   (Extracted from ${discoveredAdsResult.totalFound} total ads in JSON)`);
+            });
+            console.log('📊 Page state before scrolling:', JSON.stringify(pageDebugInfo, null, 2));
+            
+            // 🚫 Пытаемся закрыть любые overlays/popups
+            await page.evaluate(() => {
+                // Ищем и закрываем модальные окна
+                const closeButtons = document.querySelectorAll('[aria-label*="Close"], [aria-label*="close"], button[title*="Close"]');
+                closeButtons.forEach(btn => {
+                    try {
+                        btn.click();
+                        console.log('🚫 Closed popup/overlay');
+                    } catch (e) {}
+                });
+                
+                // Убираем overflow:hidden с body если есть
+                if (document.body.style.overflow === 'hidden') {
+                    document.body.style.overflow = 'auto';
+                    console.log('🔓 Removed overflow:hidden from body');
+                }
+            });
+            
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            
+            // 📸 Скриншот страницы ДО скроллинга (для диагностики)
+            try {
+                const { KeyValueStore } = await import('apify');
+                const initialScreenshot = await page.screenshot({ 
+                    fullPage: false,
+                    encoding: 'binary'
+                });
+                await KeyValueStore.setValue('page_before_scroll.png', initialScreenshot, { contentType: 'image/png' });
+                console.log('📸 Initial page screenshot saved: page_before_scroll.png');
+            } catch (screenshotError) {
+                console.log(`⚠️ Initial screenshot failed: ${screenshotError.message}`);
+            }
+            
+            // 🎯 Извлекаем целевое количество креативов ДО скроллинга
+            const expectedAdsCount = await page.evaluate(() => {
+                try {
+                    const bodyText = document.body.innerText;
+                    const patterns = [
+                        /~?(\d+)\s*results?/i,
+                        /(\d+)\s*ads?/i,
+                        /showing\s+\d+\s+of\s+(\d+)/i,
+                        /(\d+)\s*iklan/i
+                    ];
+                    
+                    for (const pattern of patterns) {
+                        const match = bodyText.match(pattern);
+                        if (match && match[1]) {
+                            const count = parseInt(match[1]);
+                            if (count > 0 && count < 10000) {
+                                return count;
+                            }
+                        }
+                    }
+                    return null;
+                } catch (e) {
+                    return null;
+                }
+            });
+            
+            if (expectedAdsCount) {
+                console.log(`🎯 Target: Facebook shows ~${expectedAdsCount} ads on this page`);
             } else {
-                // STEP 2: Fall back to DOM scraping if JSON extraction failed
-                console.log('⚠️ JSON extraction failed or found no ads');
-                console.log('📜 Method 2: Falling back to DOM scraping...');
-                console.log('   Scrolling to load ads...');
-
-                // Scroll more to load ALL ads (increased from 10 to 30)
-                await autoScroll(page, 30);
-                await new Promise(resolve => setTimeout(resolve, 5000));
-
-                console.log('🔍 Scraping DOM elements...');
-
-                discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
-                    const ads = [];
-
-                    console.log('🔍 Starting ad discovery in browser context...');
-                    console.log('Page URL:', window.location.href);
-                    console.log('Page title:', document.title);
+                console.log(`⚠️ Could not detect expected ads count, will use default scrolling`);
+            }
+            
+            // ✅ ВАЖНО: Перехватываем console.log ДО autoScroll!
+            page.on('console', msg => {
+                const text = msg.text();
+                // Пропускаем системные сообщения React/Facebook
+                if (!text.includes('Download the React DevTools') && 
+                    !text.includes('Warning:') &&
+                    !text.includes('Failed to load resource') &&
+                    text.length < 500) { // Пропускаем очень длинные логи
+                    console.log(`[Browser] ${text}`);
+                }
+            });
+            
+            // 📜 Адаптивный скроллинг до достижения ~95% от цели
+            // Для 120 ads: 120/2 = 60 скроллов × 400px = 24,000px - достаточно!
+            const targetScrolls = expectedAdsCount ? Math.min(Math.ceil(expectedAdsCount / 2), 80) : 50;
+            console.log(`📜 Will perform ${targetScrolls} scrolls (400px each) to load all ads`);
+            
+            await autoScroll(page, targetScrolls);
+            await new Promise(resolve => setTimeout(resolve, 5000));
+            
+            console.log('🔍 Checking page content...');
+            
+            // Collect ALL ads from the page (no filtering by quality)
+            const discoveredAdsResult = await page.evaluate((searchTermParam, minDays, competitorName, directUrl) => {
+                const ads = [];
+                
+                console.log('🔍 Starting ad discovery in browser context...');
+                console.log('Page URL:', window.location.href);
+                console.log('Page title:', document.title);
+                
+                // Попытка извлечь Library ID из глобальных JavaScript объектов Facebook
+                // Facebook часто хранит данные в window.__d, __APOLLO_STATE__ и других объектах
+                let globalLibraryIds = [];
+                try {
+                    // Проверяем window.__d (Facebook data)
+                    if (window.__d && Array.isArray(window.__d)) {
+                        const jsonStr = JSON.stringify(window.__d);
+                        const idMatches = jsonStr.match(/["'](\d{13,})["']/g);
+                        if (idMatches) {
+                            globalLibraryIds = idMatches.map(m => m.replace(/["']/g, '')).filter(id => id.length >= 13);
+                            console.log(`🔍 Found ${globalLibraryIds.length} potential Library IDs in window.__d`);
+                        }
+                    }
+                    
+                    // Проверяем window.__APOLLO_STATE__
+                    if (window.__APOLLO_STATE__) {
+                        const apolloStr = JSON.stringify(window.__APOLLO_STATE__);
+                        const apolloIds = apolloStr.match(/["'](\d{13,})["']/g);
+                        if (apolloIds) {
+                            const ids = apolloIds.map(m => m.replace(/["']/g, '')).filter(id => id.length >= 13);
+                            globalLibraryIds = [...new Set([...globalLibraryIds, ...ids])];
+                            console.log(`🔍 Found ${ids.length} potential Library IDs in __APOLLO_STATE__`);
+                        }
+                    }
+                    
+                    // Проверяем все глобальные переменные на наличие длинных чисел
+                    const globalVars = Object.keys(window).filter(key => 
+                        typeof window[key] === 'object' && window[key] !== null
+                    );
+                    for (const varName of globalVars.slice(0, 10)) { // Проверяем первые 10
+                        try {
+                            const varStr = JSON.stringify(window[varName]);
+                            const matches = varStr.match(/["'](\d{13,})["']/g);
+                            if (matches && matches.length > 0) {
+                                const ids = matches.map(m => m.replace(/["']/g, '')).filter(id => id.length >= 13);
+                                if (ids.length > 0 && ids.length < 100) { // Разумное количество
+                                    globalLibraryIds = [...new Set([...globalLibraryIds, ...ids])];
+                                    console.log(`🔍 Found ${ids.length} IDs in window.${varName}`);
+                                }
+                            }
+                        } catch (e) {
+                            // Игнорируем ошибки сериализации
+                        }
+                    }
+                } catch (e) {
+                    console.log('⚠️ Error extracting IDs from global objects:', e.message);
+                }
+                
+                console.log(`📊 Total potential Library IDs found globally: ${globalLibraryIds.length}`);
                 
                 // Check for different possible ad containers
                 const testSelectors = {
@@ -444,7 +413,7 @@ const crawlerOptions = {
                         // Extract all available information
                         const advertiserInfo = extractAdvertiserInfo(container);
                         const adContent = extractAdContent(container);
-                        const mediaAssets = extractMediaAssets(container);
+                        const mediaAssets = extractMediaAssets(container, index); // ✅ Передаем индекс для логирования
                         const activeDays = extractActiveDays(container);
                         
                         // Debug first 3 containers - store for return
@@ -465,13 +434,14 @@ const crawlerOptions = {
                             });
                         }
                         
-                        // Simple filters: just check if we have basic data and meets min days
+                        // Simple filters: just check if we have basic data
+                        // УБРАЛИ фильтр по minActiveDays - собираем ВСЕ креативы независимо от количества дней
                         const hasBasicData = advertiserInfo.name && 
                             advertiserInfo.name !== 'Unknown' &&
-                                            advertiserInfo.name !== 'Meta Ad Library' &&
-                                            adContent.text &&
-                                            adContent.text.length > 30 &&
-                                            activeDays >= minDays;
+                            advertiserInfo.name !== 'Meta Ad Library' &&
+                            adContent.text &&
+                            adContent.text.length > 30;
+                            // activeDays >= minDays - УБРАНО для сбора всех креативов
                         
                         // Track UI elements rejected
                         if (adContent.uiElementsRejected > 0) {
@@ -487,16 +457,88 @@ const crawlerOptions = {
                             else if (advertiserInfo.name === 'Meta Ad Library') reason = 'Meta Ad Library';
                             else if (!adContent.text) reason = 'No ad text';
                             else if (adContent.text.length <= 30) reason = 'Text too short';
-                            else if (activeDays < minDays) reason = `Active days ${activeDays} < ${minDays}`;
+                            // Убрали проверку activeDays - собираем все креативы
                             rejectionReasons.push(reason);
+                            
+                            // 🔍 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ отброшенных контейнеров (первые 10)
+                            if (index < 10) {
+                                console.log(`\n❌ [REJECTED CONTAINER #${index}] Reason: ${reason}`);
+                                console.log(`   Advertiser: "${advertiserInfo.name || 'N/A'}"`);
+                                console.log(`   Page name: "${advertiserInfo.pageName || 'N/A'}"`);
+                                console.log(`   Text length: ${adContent.text?.length || 0} chars`);
+                                console.log(`   Text preview: "${adContent.text?.substring(0, 100) || ''}${adContent.text?.length > 100 ? '...' : ''}"`);
+                                console.log(`   Active days: ${adContent.activeDays || 'N/A'}`);
+                                console.log(`   Images extracted: ${mediaAssets.images.length}`);
+                                console.log(`   Videos extracted: ${mediaAssets.videos.length}`);
+                                
+                                // 🖼️ Показываем изображения из этого контейнера
+                                if (mediaAssets.images.length > 0) {
+                                    console.log(`\n   📸 Extracted images from this container:`);
+                                    mediaAssets.images.forEach((img, imgIdx) => {
+                                        if (imgIdx < 3) {
+                                            console.log(`      ${imgIdx + 1}. ${img.width}x${img.height} (${img.type}) - ${img.url.substring(0, 100)}...`);
+                                        }
+                                    });
+                                    if (mediaAssets.images.length > 3) {
+                                        console.log(`      ... and ${mediaAssets.images.length - 3} more`);
+                                    }
+                                } else {
+                                    console.log(`\n   📷 No images extracted from container`);
+                                    
+                                    // Проверяем сколько img tags было в HTML
+                                    const imgTags = container.querySelectorAll('img');
+                                    if (imgTags.length > 0) {
+                                        console.log(`   ⚠️ But found ${imgTags.length} raw img tags in HTML:`);
+                                        for (let i = 0; i < Math.min(3, imgTags.length); i++) {
+                                            const src = imgTags[i].src || imgTags[i].dataset?.src || 'N/A';
+                                            const w = imgTags[i].offsetWidth || imgTags[i].naturalWidth || 0;
+                                            const h = imgTags[i].offsetHeight || imgTags[i].naturalHeight || 0;
+                                            console.log(`      ${i+1}. ${w}x${h} - ${src.substring(0, 100)}${src.length > 100 ? '...' : ''}`);
+                                        }
+                                        if (imgTags.length > 3) {
+                                            console.log(`      ... and ${imgTags.length - 3} more`);
+                                        }
+                                    }
+                                }
+                            }
                         }
                         
                         if (hasBasicData) {
                             const kidsData = extractKidsEdTechData(adContent.text);
                             
+                            // Используем libraryId как основной ID, если он найден
+                            // Иначе создаем временный ID на основе содержимого для дедупликации
+                            const primaryId = adContent.libraryId || 
+                                            (adContent.text.substring(0, 50) + mediaAssets.images[0]?.url?.substring(0, 50) || '').replace(/[^a-zA-Z0-9]/g, '_').substring(0, 100);
+                            
+                            // Используем libraryId как adId, если он найден
+                            // Иначе создаем временный ID (но это должно быть редко)
+                            const finalAdId = adContent.libraryId || `discovered_${Date.now()}_${index}`;
+                            
+                            // 📊 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ для Library ID
+                            if (!adContent.libraryId && index < 10) {
+                                console.log(`⚠️ [AD #${index}] Library ID NOT FOUND!`);
+                                console.log(`   → Using fallback ID: ${finalAdId}`);
+                                console.log(`   → Container ID: ${container.id || 'N/A'}`);
+                                console.log(`   → Container class: ${container.className?.substring(0, 100) || 'N/A'}`);
+                                console.log(`   → Links in container: ${container.querySelectorAll('a').length}`);
+                                const firstLink = container.querySelector('a');
+                                if (firstLink) {
+                                    console.log(`   → First link href: ${firstLink.href?.substring(0, 150) || 'N/A'}`);
+                                    console.log(`   → First link text: ${firstLink.textContent?.substring(0, 50) || 'N/A'}`);
+                                }
+                                console.log(`   → Data attributes:`, {
+                                    'data-id': container.getAttribute('data-id'),
+                                    'data-library-id': container.getAttribute('data-library-id'),
+                                    'data-ad-id': container.getAttribute('data-ad-id')
+                                });
+                            } else if (adContent.libraryId && index < 3) {
+                                console.log(`✅ [AD #${index}] Library ID found: ${adContent.libraryId}`);
+                            }
+                            
                             ads.push({
                                 // Core identification
-                                adId: `discovered_${Date.now()}_${index}`,
+                                adId: finalAdId,
                                 libraryId: adContent.libraryId,
                                 advertiserName: advertiserInfo.name,
                                 adText: adContent.text.substring(0, 600),
@@ -678,18 +720,174 @@ const crawlerOptions = {
                         if (adText) break;
                     }
                     
-                    // Extract library ID
-                    const fullText = container.textContent || '';
-                    const libIdMatch = fullText.match(/library[:\s]+(\d+)/i) || 
-                                      fullText.match(/id[:\s]+(\d+)/i);
-                    if (libIdMatch) {
-                        libraryId = libIdMatch[1];
+                    // Extract library ID - АГРЕССИВНЫЙ поиск во всех возможных местах
+                    // 1. Из URL ссылок в контейнере (расширенные паттерны)
+                    const allLinks = container.querySelectorAll('a[href]');
+                    for (const link of allLinks) {
+                        const href = link.getAttribute('href') || '';
+                        // Ищем library ID в различных форматах URL:
+                        // - /ads/library/?id=1776847809663660
+                        // - /ads/library/?active_status=...&id=1776847809663660
+                        // - https://www.facebook.com/ads/library/?id=1776847809663660
+                        const urlIdMatch = href.match(/[?&]id=(\d{10,})/i) ||  // Минимум 10 цифр для Library ID
+                                          href.match(/\/ads\/library\/\?.*id=(\d{10,})/i) ||
+                                          href.match(/\/ads\/library\/\?id=(\d{10,})/i) ||
+                                          href.match(/facebook\.com\/ads\/library\/\?.*id=(\d{10,})/i) ||
+                                          href.match(/\/ads\/library\/.*[?&]ad_id=(\d{10,})/i) ||
+                                          href.match(/\/ads\/library\/.*[?&]library_id=(\d{10,})/i);
+                        if (urlIdMatch && urlIdMatch[1]) {
+                            libraryId = urlIdMatch[1];
+                            break;
+                        }
+                    }
+                    
+                    // 1.5. Попытка кликнуть на "View Ad" или подобную ссылку для получения ID из URL
+                    if (!libraryId) {
+                        const viewAdLinks = container.querySelectorAll('a[href*="/ads/library/"], a[href*="view"], a[aria-label*="View"], a[aria-label*="view"]');
+                        for (const link of viewAdLinks) {
+                            const href = link.getAttribute('href') || '';
+                            const idMatch = href.match(/[?&]id=(\d{10,})/i);
+                            if (idMatch && idMatch[1]) {
+                                libraryId = idMatch[1];
+                                break;
+                            }
+                        }
+                    }
+                    
+                    // 2. Из data-атрибутов (расширенный поиск)
+                    if (!libraryId) {
+                        // Проверяем сам контейнер
+                        const dataId = container.getAttribute('data-ad-id') || 
+                                       container.getAttribute('data-id') ||
+                                       container.getAttribute('data-library-id') ||
+                                       container.getAttribute('aria-label')?.match(/(\d{10,})/)?.[1];
+                        
+                        // Проверяем дочерние элементы
+                        if (!dataId) {
+                            const childWithId = container.querySelector('[data-ad-id], [data-id], [data-library-id]');
+                            if (childWithId) {
+                                const childId = childWithId.getAttribute('data-ad-id') || 
+                                              childWithId.getAttribute('data-id') ||
+                                              childWithId.getAttribute('data-library-id');
+                                if (childId && /^\d{10,}$/.test(childId)) {
+                                    libraryId = childId;
+                                }
+                            }
+                        } else if (/^\d{10,}$/.test(dataId)) {
+                            libraryId = dataId;
+                        }
+                    }
+                    
+                    // 3. Из текста контейнера (расширенные паттерны)
+                    if (!libraryId) {
+                        const fullText = container.textContent || '';
+                        const innerHTML = container.innerHTML || '';
+                        
+                        // Паттерны для поиска Library ID в тексте:
+                        // - "Library ID: 1776847809663660"
+                        // - "Library: 1776847809663660"
+                        // - "ID: 1776847809663660"
+                        // - "1776847809663660" (длинное число само по себе)
+                        const libIdMatch = fullText.match(/library[:\s]+id[:\s]+(\d{10,})/i) ||
+                                          fullText.match(/library[:\s]+(\d{10,})/i) ||
+                                          fullText.match(/ad[:\s]+id[:\s]+(\d{10,})/i) ||
+                                          fullText.match(/id[:\s]+(\d{10,})/i) ||
+                                          // Ищем длинные числа (13+ цифр) которые могут быть Library ID
+                                          fullText.match(/\b(\d{13,})\b/); // Library ID обычно 13-16 цифр
+                        
+                        if (libIdMatch && libIdMatch[1]) {
+                            const potentialId = libIdMatch[1];
+                            // Проверяем что это не год или другая дата
+                            if (potentialId.length >= 10 && !potentialId.match(/^(19|20)\d{2}$/)) {
+                                libraryId = potentialId;
+                            }
+                        }
+                        
+                        // Также проверяем в HTML (может быть в скрытых атрибутах)
+                        if (!libraryId && innerHTML) {
+                            const htmlIdMatch = innerHTML.match(/id[=:]\s*["']?(\d{10,})["']?/i) ||
+                                               innerHTML.match(/library[_-]?id[=:]\s*["']?(\d{10,})["']?/i);
+                            if (htmlIdMatch && htmlIdMatch[1]) {
+                                libraryId = htmlIdMatch[1];
+                            }
+                        }
+                    }
+                    
+                    // 4. Из aria-label и других доступных атрибутов
+                    if (!libraryId) {
+                        const ariaLabel = container.getAttribute('aria-label') || '';
+                        const ariaLabelMatch = ariaLabel.match(/(\d{10,})/);
+                        if (ariaLabelMatch && ariaLabelMatch[1]) {
+                            libraryId = ariaLabelMatch[1];
+                        }
+                    }
+                    
+                    // 5. Поиск в родительских элементах и соседних контейнерах
+                    if (!libraryId) {
+                        // Проверяем родительский элемент
+                        let parent = container.parentElement;
+                        for (let i = 0; i < 3 && parent; i++) {
+                            const parentLinks = parent.querySelectorAll('a[href]');
+                            for (const link of parentLinks) {
+                                const href = link.getAttribute('href') || '';
+                                const urlIdMatch = href.match(/[?&]id=(\d{10,})/i);
+                                if (urlIdMatch && urlIdMatch[1]) {
+                                    libraryId = urlIdMatch[1];
+                                    break;
+                                }
+                            }
+                            if (libraryId) break;
+                            parent = parent.parentElement;
+                        }
+                    }
+                    
+                    // 6. Поиск в соседних элементах (предыдущий/следующий sibling)
+                    if (!libraryId) {
+                        const siblings = [
+                            container.previousElementSibling,
+                            container.nextElementSibling
+                        ].filter(Boolean);
+                        
+                        for (const sibling of siblings) {
+                            const siblingLinks = sibling.querySelectorAll('a[href]');
+                            for (const link of siblingLinks) {
+                                const href = link.getAttribute('href') || '';
+                                const urlIdMatch = href.match(/[?&]id=(\d{10,})/i);
+                                if (urlIdMatch && urlIdMatch[1]) {
+                                    libraryId = urlIdMatch[1];
+                                    break;
+                                }
+                            }
+                            if (libraryId) break;
+                        }
+                    }
+                    
+                    // 7. Поиск в глобальном контексте страницы (последняя попытка)
+                    if (!libraryId) {
+                        // Ищем все ссылки на странице с /ads/library/?id=
+                        const allPageLinks = document.querySelectorAll('a[href*="/ads/library/"]');
+                        for (const link of allPageLinks) {
+                            const href = link.getAttribute('href') || '';
+                            // Проверяем близость к нашему контейнеру
+                            const rect = container.getBoundingClientRect();
+                            const linkRect = link.getBoundingClientRect();
+                            const distance = Math.abs(rect.top - linkRect.top) + Math.abs(rect.left - linkRect.left);
+                            
+                            // Если ссылка близко к контейнеру (в пределах 500px)
+                            if (distance < 500) {
+                                const urlIdMatch = href.match(/[?&]id=(\d{10,})/i);
+                                if (urlIdMatch && urlIdMatch[1]) {
+                                    libraryId = urlIdMatch[1];
+                                    break;
+                                }
+                            }
+                        }
                     }
                     
                     // Extract Landing Page URL - ENHANCED with Facebook redirect decoding
-                    const allLinks = container.querySelectorAll('a[href]');
+                    const landingPageLinks = container.querySelectorAll('a[href]');
                     const landingPageDebug = {
-                        totalLinks: allLinks.length,
+                        totalLinks: landingPageLinks.length,
                         checkedLinks: [],
                         strategyUsed: null
                     };
@@ -704,7 +902,7 @@ const crawlerOptions = {
                     }
                     
                     // Strategy 0: Facebook redirect URL decoding (NEW!)
-                    for (const link of allLinks) {
+                    for (const link of landingPageLinks) {
                         const href = link.getAttribute('href') || '';
                         
                         // Log first 5 links
@@ -744,7 +942,7 @@ const crawlerOptions = {
                     
                     // Strategy 1: Direct href check
                     if (!landingPageUrl) {
-                        for (const link of allLinks) {
+                        for (const link of landingPageLinks) {
                             let href = link.getAttribute('href') || '';
                             
                             if (href && 
@@ -774,7 +972,7 @@ const crawlerOptions = {
                     
                     // Strategy 3: Check onclick for URL
                     if (!landingPageUrl) {
-                        for (const link of allLinks) {
+                        for (const link of landingPageLinks) {
                             const onclick = link.getAttribute('onclick') || '';
                             const urlMatch = onclick.match(/https?:\/\/[^\s"']+/);
                             if (urlMatch && 
@@ -855,6 +1053,23 @@ const crawlerOptions = {
                         }
                     }
                     
+                    // DEBUG: Логируем результат извлечения Library ID для первых 3 креативов
+                    const isDebugContainer = ads.length < 3;
+                    if (isDebugContainer && !libraryId) {
+                        console.log(`⚠️ DEBUG Container #${ads.length + 1}: Library ID NOT FOUND`);
+                        console.log(`   Container text preview: ${(container.textContent || '').substring(0, 150)}...`);
+                        const linksCount = container.querySelectorAll('a[href]').length;
+                        console.log(`   Links in container: ${linksCount}`);
+                        if (linksCount > 0) {
+                            const firstLink = container.querySelector('a[href]');
+                            if (firstLink) {
+                                console.log(`   First link href: ${(firstLink.getAttribute('href') || '').substring(0, 100)}...`);
+                            }
+                        }
+                    } else if (isDebugContainer && libraryId) {
+                        console.log(`✅ DEBUG Container #${ads.length + 1}: Library ID found: ${libraryId}`);
+                    }
+                    
                     return { 
                         text: adText, 
                         libraryId: libraryId,
@@ -865,7 +1080,7 @@ const crawlerOptions = {
                     };
                 }
                 
-                function extractMediaAssets(container) {
+                function extractMediaAssets(container, containerIndex = 999) {
                     const media = {
                         images: [],
                         videos: [],
@@ -874,15 +1089,82 @@ const crawlerOptions = {
                     
                     // Extract images
                     const images = container.querySelectorAll('img');
+                    let extractedCount = 0;
+                    let skippedCount = 0;
+                    let skippedReasons = [];
+                    
                     images.forEach((img, index) => {
-                        const src = img.src || img.dataset.src || img.getAttribute('data-src');
-                        if (src && isValidAdMedia(src)) {
-                            const width = img.naturalWidth || img.offsetWidth || 0;
-                            const height = img.naturalHeight || img.offsetHeight || 0;
+                        // ✅ РАСШИРЕННОЕ ИЗВЛЕЧЕНИЕ URL - проверяем ВСЕ возможные атрибуты
+                        const src = img.src || 
+                                   img.dataset.src || 
+                                   img.getAttribute('data-src') ||
+                                   img.getAttribute('data-lazy-src') ||
+                                   img.getAttribute('data-original') ||
+                                   (img.srcset ? img.srcset.split(' ')[0] : null) ||
+                                   '';
+                        
+                        if (!src) {
+                            skippedCount++;
+                            skippedReasons.push(`img[${index}]: no src`);
+                            return;
+                        }
+                        
+                        // Проверяем через isValidAdMedia (теперь пропускает все scontent/fbcdn!)
+                        if (!isValidAdMedia(src)) {
+                            skippedCount++;
+                            skippedReasons.push(`img[${index}]: invalid URL (${src.substring(0, 50)}...)`);
+                            return;
+                        }
+                        
+                        // Try multiple ways to get dimensions (lazy loading fix)
+                        let width = img.naturalWidth || img.offsetWidth || 
+                                   parseInt(img.getAttribute('width')) || 
+                                   parseInt(img.style.width) || 0;
+                        let height = img.naturalHeight || img.offsetHeight || 
+                                    parseInt(img.getAttribute('height')) || 
+                                    parseInt(img.style.height) || 0;
+                        
+                        // ✅ ПРИОРИТЕТ для Facebook CDN
+                        const isFacebookCDN = src.includes('scontent') || 
+                                             src.includes('fbcdn') ||
+                                             src.includes('external');
+                        
+                        if (isFacebookCDN) {
+                            // ⚠️ Facebook CDN: пропускаем МАЛЕНЬКИЕ изображения (< 150x150)
+                            // Логотипы/аватары обычно маленькие, превью креативов - большие!
+                            if (width > 0 && height > 0 && (width < 150 || height < 150)) {
+                                skippedCount++;
+                                skippedReasons.push(`img[${index}]: FB CDN but too small for ad (${width}x${height})`);
+                                return;
+                            }
                             
-                            // Skip very small images (logos, icons) - must be at least 200x200
-                            if (width > 0 && height > 0 && (width < 200 || height < 200)) {
-                                return; // Skip this image
+                            // ✅ Facebook CDN + достаточно большое = сохраняем!
+                            media.images.push({
+                                url: src,
+                                alt: img.alt || '',
+                                width: width,
+                                height: height,
+                                aspectRatio: height > 0 ? (width / height).toFixed(2) : null,
+                                isHighRes: width >= 400 && height >= 400,
+                                position: index,
+                                type: determineImageType(width, height),
+                                format: getImageFormat(src)
+                            });
+                            extractedCount++;
+                        } else {
+                            // ⚠️ НЕ-Facebook изображения - применяем фильтры
+                            // Пропускаем только очень маленькие иконки (< 80px)
+                            if (width > 0 && height > 0 && width < 80 && height < 80) {
+                                skippedCount++;
+                                skippedReasons.push(`img[${index}]: too small (${width}x${height})`);
+                                return;
+                            }
+                            
+                            // Если нет размеров - пропускаем (может быть иконка)
+                            if (width === 0 && height === 0) {
+                                skippedCount++;
+                                skippedReasons.push(`img[${index}]: no dimensions`);
+                                return;
                             }
                             
                             media.images.push({
@@ -896,8 +1178,132 @@ const crawlerOptions = {
                                 type: determineImageType(width, height),
                                 format: getImageFormat(src)
                             });
+                            extractedCount++;
                         }
                     });
+                    
+                    // 📊 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ для отладки (первые 5 контейнеров)
+                    if (containerIndex < 5) {
+                        console.log(`\n🔍 [CONTAINER #${containerIndex}] Image extraction analysis:`);
+                        console.log(`   Total img tags found: ${images.length}`);
+                        console.log(`   ✅ Extracted: ${extractedCount}`);
+                        console.log(`   ❌ Skipped: ${skippedCount}`);
+                        
+                        if (images.length > 0) {
+                            console.log(`\n   📷 Analyzing all ${images.length} images in container:`);
+                            images.forEach((img, idx) => {
+                                if (idx < 8) { // Первые 8 изображений
+                                    const src = img.src || 
+                                               img.dataset.src || 
+                                               img.getAttribute('data-src') ||
+                                               img.getAttribute('data-lazy-src') ||
+                                               img.getAttribute('data-original') ||
+                                               (img.srcset ? img.srcset.split(' ')[0] : null) ||
+                                               '';
+                                    
+                                    const width = img.naturalWidth || img.offsetWidth || 
+                                                 parseInt(img.getAttribute('width')) || 
+                                                 parseInt(img.style.width) || 0;
+                                    const height = img.naturalHeight || img.offsetHeight || 
+                                                  parseInt(img.getAttribute('height')) || 
+                                                  parseInt(img.style.height) || 0;
+                                    
+                                    console.log(`\n      Image ${idx + 1}/${images.length}:`);
+                                    console.log(`        Size: ${width}x${height}`);
+                                    console.log(`        URL: ${src.substring(0, 120)}${src.length > 120 ? '...' : ''}`);
+                                    
+                                    // Проверяем каждый фильтр отдельно
+                                    let rejectedReason = '✅ PASSED all filters';
+                                    
+                                    if (!src) {
+                                        rejectedReason = '❌ REJECTED: No src found';
+                                    } else {
+                                        const isFacebookCDN = src.includes('scontent') || src.includes('fbcdn') || src.includes('external');
+                                        console.log(`        Facebook CDN: ${isFacebookCDN}`);
+                                        
+                                        if (!isValidAdMedia(src)) {
+                                            rejectedReason = '❌ REJECTED by isValidAdMedia()';
+                                            // 🔍 Показываем ТОЧНЫЙ паттерн который сработал (используем ТЕ ЖЕ регекспы что и в isValidAdMedia!)
+                                            const matchedPatterns = [];
+                                            if (src.includes('logo')) matchedPatterns.push("'logo'");
+                                            if (src.includes('avatar')) matchedPatterns.push("'avatar'");
+                                            if (src.includes('profile')) matchedPatterns.push("'profile'");
+                                            if (src.includes('_thumb_')) matchedPatterns.push("'_thumb_'");
+                                            if (src.match(/p\d{2,3}x\d{2,3}/)) matchedPatterns.push("p200x200 (profile)");
+                                            if (src.match(/_s\d{1,2}x\d{1,2}[_\.]/)) matchedPatterns.push("_s60x60_ (small thumb)");
+                                            if (src.match(/[=_]s\d{1,2}x\d{1,2}[_&\.]/)) matchedPatterns.push("=s60x60_ (query param)");
+                                            if (matchedPatterns.length > 0) {
+                                                console.log(`           Matched patterns: ${matchedPatterns.join(', ')}`);
+                                            } else {
+                                                console.log(`           Rejected for: not Facebook CDN + length=${src.length}`);
+                                            }
+                                        } else if (isFacebookCDN && width > 0 && height > 0 && (width < 150 || height < 150)) {
+                                            rejectedReason = `❌ REJECTED: FB CDN but too small (${width}x${height} < 150px)`;
+                                        } else if (width === 0 && height === 0) {
+                                            rejectedReason = `❌ REJECTED: No dimensions (naturalWidth/offsetWidth = 0)`;
+                                        }
+                                    }
+                                    
+                                    console.log(`        ${rejectedReason}`);
+                                }
+                            });
+                        }
+                    }
+                    
+                    // 📊 КРАТКОЕ ЛОГИРОВАНИЕ для отладки
+                    if (media.images.length === 0 && images.length > 0) {
+                        console.log(`\n⚠️ [REJECTED CONTAINER] Found ${images.length} img tags but NONE extracted!`);
+                        console.log(`   Extracted: ${extractedCount}, Skipped: ${skippedCount}`);
+                        
+                        // 🖼️ Показываем ВСЕ изображения с детальными причинами отклонения
+                        console.log(`\n   📷 Analyzing all ${images.length} images in container:`);
+                        images.forEach((img, idx) => {
+                            if (idx < 5) { // Первые 5 изображений
+                                const src = img.src || 
+                                           img.dataset.src || 
+                                           img.getAttribute('data-src') ||
+                                           img.getAttribute('data-lazy-src') ||
+                                           '';
+                                const width = img.naturalWidth || img.offsetWidth || parseInt(img.getAttribute('width')) || 0;
+                                const height = img.naturalHeight || img.offsetHeight || parseInt(img.getAttribute('height')) || 0;
+                                
+                                console.log(`\n      Image ${idx + 1}/${images.length}:`);
+                                console.log(`        Size: ${width}x${height}`);
+                                console.log(`        URL: ${src.substring(0, 120)}${src.length > 120 ? '...' : ''}`);
+                                
+                                // Проверяем почему отклонено
+                                if (!src) {
+                                    console.log(`        ❌ REJECTED: No src attribute found`);
+                                } else {
+                                    const isFacebookCDN = src.includes('scontent') || src.includes('fbcdn') || src.includes('external');
+                                    const hasLogo = src.includes('logo');
+                                    const hasAvatar = src.includes('avatar');
+                                    const hasProfile = src.includes('profile');
+                                    const hasThumb = src.includes('_thumb_');
+                                    const hasSizePattern = /[ps]\d{2,4}x\d{2,4}/.test(src);
+                                    
+                                    if (!isValidAdMedia(src)) {
+                                        console.log(`        ❌ REJECTED: isValidAdMedia = false`);
+                                        console.log(`           Patterns found: logo=${hasLogo}, avatar=${hasAvatar}, profile=${hasProfile}, thumb=${hasThumb}, size_pattern=${hasSizePattern}`);
+                                    } else if (isFacebookCDN && (width > 0 && height > 0) && (width < 200 || height < 200)) {
+                                        console.log(`        ❌ REJECTED: Facebook CDN but too small (< 200px)`);
+                                    } else if (!isFacebookCDN && (width > 0 && height > 0) && (width < 80 || height < 80)) {
+                                        console.log(`        ❌ REJECTED: Non-Facebook image too small (< 80px)`);
+                                    } else {
+                                        console.log(`        ✅ PASSED all filters (may be lazy-loaded, dimensions unknown)`);
+                                    }
+                                }
+                            }
+                        });
+                        
+                        if (images.length > 5) {
+                            console.log(`\n      ... and ${images.length - 5} more images (not shown)`);
+                        }
+                    } else if (media.images.length === 0 && images.length === 0) {
+                        console.log(`⚠️ [AD CONTAINER] NO img tags found in HTML`);
+                    } else {
+                        console.log(`✅ [AD CONTAINER] Extracted ${media.images.length} images (skipped ${skippedCount})`);
+                    }
                     
                     // Extract videos
                     const videos = container.querySelectorAll('video');
@@ -1002,15 +1408,35 @@ const crawlerOptions = {
                 function isValidAdMedia(url) {
                     if (!url || url.includes('data:image')) return false;
                     
-                    const excludePatterns = [
-                        'profile_pic', 'favicon', '/images/emoji/', 'spinner', 'icon-',
-                        '_thumb', '_small', 'avatar', 'logo_', 'button',
-                        // Exclude small thumbnail sizes (60x60, 80x80, 120x120, etc.)
-                        's60x60', 's80x80', 's120x120', 's150x150', 's200x200'
+                    // ⚠️ Исключаем логотипы/аватары/профили ДЛЯ ВСЕХ URL (включая Facebook CDN!)
+                    const logoPatterns = [
+                        'favicon', '/images/emoji/', 'spinner', 'icon-',
+                        'profile_pic', 'avatar', 'logo', 'button',
+                        '_thumb_', // Миниатюры профилей
+                        /p\d{2,3}x\d{2,3}/, // Паттерн p200x200 = profile picture (до p999x999)
+                        /_s\d{1,2}x\d{1,2}[_\.]/, // ✅ Паттерн _s60x60_ или _s60x60. (profile thumbnails)
+                        /[=_]s\d{1,2}x\d{1,2}[_&\.]/ // ✅ Паттерн =s60x60_ или _s60x60& (query params)
                     ];
                     
-                    return !excludePatterns.some(pattern => url.includes(pattern)) &&
-                           url.length > 50; // Reasonable URL length
+                    const hasLogoPattern = logoPatterns.some(pattern => {
+                        if (pattern instanceof RegExp) {
+                            return pattern.test(url);
+                        }
+                        return url.includes(pattern);
+                    });
+                    
+                    if (hasLogoPattern) {
+                        return false; // ❌ Исключаем логотипы/аватары даже с Facebook CDN
+                    }
+                    
+                    // ✅ Приоритет для scontent/fbcdn - это рекламные изображения
+                    const isFacebookCDN = url.includes('scontent') || url.includes('fbcdn') || url.includes('external');
+                    if (isFacebookCDN) {
+                        return true; // ✅ Принимаем Facebook CDN (после проверки на логотипы)
+                    }
+                    
+                    // ⚠️ Для остальных URL - минимальная длина
+                    return url.length > 40;
                 }
                 
                 function determineImageType(width, height) {
@@ -1046,30 +1472,39 @@ const crawlerOptions = {
                 function getHighestResolutionImages(images) {
                     if (!images || images.length === 0) return [];
                     
-                    // Group images by position (carousel items)
-                    const imagesByPosition = {};
-                    images.forEach(img => {
-                        const pos = img.position || 0;
-                        if (!imagesByPosition[pos]) {
-                            imagesByPosition[pos] = [];
-                        }
-                        imagesByPosition[pos].push(img);
-                    });
+                    // ✅ НОВАЯ ЛОГИКА: Сортируем ВСЕ изображения по размеру (большие первыми)
+                    // Это гарантирует что превью креатива (обычно самое большое) будет первым
+                    // А логотипы/аватары (маленькие) - в конце или отфильтрованы
                     
-                    // For each position, select highest resolution
-                    const highestResImages = [];
-                    Object.values(imagesByPosition).forEach(positionImages => {
-                        const highest = positionImages.reduce((best, current) => {
-                            const bestResolution = (best.width || 0) * (best.height || 0);
-                            const currentResolution = (current.width || 0) * (current.height || 0);
-                            return currentResolution > bestResolution ? current : best;
+                    const sorted = images
+                        .map(img => ({
+                            url: img.url,
+                            width: img.width || 0,
+                            height: img.height || 0,
+                            resolution: (img.width || 0) * (img.height || 0),
+                            position: img.position || 0
+                        }))
+                        .sort((a, b) => {
+                            // Сначала сортируем по размеру (большие первыми)
+                            if (b.resolution !== a.resolution) {
+                                return b.resolution - a.resolution;
+                            }
+                            // При равном размере - по позиции (меньшие первыми)
+                            return a.position - b.position;
                         });
-                        if (highest && highest.url) {
-                            highestResImages.push(highest.url);
-                        }
-                    });
                     
-                    return highestResImages;
+                    // Убираем дубликаты URL (оставляем только уникальные)
+                    const uniqueUrls = [];
+                    const seenUrls = new Set();
+                    
+                    for (const img of sorted) {
+                        if (img.url && !seenUrls.has(img.url)) {
+                            uniqueUrls.push(img.url);
+                            seenUrls.add(img.url);
+                        }
+                    }
+                    
+                    return uniqueUrls;
                 }
                 
                 function getHighestResolutionVideos(videos) {
@@ -1102,22 +1537,32 @@ const crawlerOptions = {
                 }
                 
                 // Log rejection reasons summary
-                console.log(`\n📊 Rejection summary (out of ${potentialAdContainers.length} containers):`);
+                console.log(`\n📊 DETAILED Rejection Summary:`);
+                console.log(`   Total containers checked: ${potentialAdContainers.length}`);
+                console.log(`   ✅ Accepted as ads: ${ads.length}`);
+                console.log(`   ❌ Rejected: ${potentialAdContainers.length - ads.length}`);
+                
+                console.log(`\n   Rejection breakdown:`);
                 const reasonCounts = {};
                 rejectionReasons.forEach(r => {
                     reasonCounts[r] = (reasonCounts[r] || 0) + 1;
                 });
-                Object.entries(reasonCounts).forEach(([reason, count]) => {
-                    console.log(`  ${reason}: ${count}`);
-                });
-                console.log(`  Accepted: ${ads.length}`);
+                Object.entries(reasonCounts)
+                    .sort((a, b) => b[1] - a[1]) // Сортируем по количеству (больше первыми)
+                    .forEach(([reason, count]) => {
+                        const percentage = Math.round((count / potentialAdContainers.length) * 100);
+                        console.log(`     ${reason}: ${count} (${percentage}%)`);
+                    });
+                
+                console.log(`\n   💡 Analysis:`);
+                console.log(`      - Containers with ads: ${ads.length}`);
+                console.log(`      - Containers rejected: ${potentialAdContainers.length - ads.length}`);
+                console.log(`      - Success rate: ${Math.round((ads.length / potentialAdContainers.length) * 100)}%`);
                 
                 // Return both ads and debug info
+                // Убрали ограничение в 100 креативов - собираем все найденные
                 return {
-                    ads: ads.slice(0, 100), // Limit to 100 ads per competitor
-                    method: 'dom_scraping',
-                    success: true,
-                    totalFound: ads.length,
+                    ads: ads, // Собираем все креативы без ограничений
                     debug: {
                         selectorCounts: testSelectors,
                         totalContainers: allContainers.length,
@@ -1130,31 +1575,20 @@ const crawlerOptions = {
                         pageTitle: document.title
                     }
                 };
-
-                }, searchTerm, minActiveDays, competitorName, directUrl);
-            }
-
-            // Log results (works for both JSON and DOM methods)
-            console.log('📊 Scraping Results:');
-            console.log(`   Method used: ${discoveredAdsResult.method}`);
-            console.log(`   Success: ${discoveredAdsResult.success}`);
-            console.log(`   Ads found: ${discoveredAdsResult.ads.length}`);
-
-            // Log debug info if available (DOM scraping provides this)
-            if (discoveredAdsResult.debug) {
-                console.log('\n📊 Debug Info from Browser:');
-                console.log(`   URL: ${discoveredAdsResult.debug.pageUrl}`);
-                console.log(`   Title: ${discoveredAdsResult.debug.pageTitle}`);
-                console.log(`   Selector counts:`, JSON.stringify(discoveredAdsResult.debug.selectorCounts));
-                console.log(`   Total containers checked: ${discoveredAdsResult.debug.totalContainers}`);
-                console.log(`   Potential ad containers: ${discoveredAdsResult.debug.potentialAdContainers}`);
-            }
+                
+            }, searchTerm, minActiveDays, competitorName, directUrl);
             
-            // Log first 3 sample extractions (only for DOM scraping)
-            if (discoveredAdsResult.debug && discoveredAdsResult.debug.debugSamples) {
-                console.log('\n🔬 Sample Extractions (first 3 containers):');
-            }
-            if (discoveredAdsResult.debug && discoveredAdsResult.debug.debugSamples && discoveredAdsResult.debug.debugSamples.length > 0) {
+            // Log debug info from browser
+            console.log('📊 Debug Info from Browser:');
+            console.log(`   URL: ${discoveredAdsResult.debug.pageUrl}`);
+            console.log(`   Title: ${discoveredAdsResult.debug.pageTitle}`);
+            console.log(`   Selector counts:`, JSON.stringify(discoveredAdsResult.debug.selectorCounts));
+            console.log(`   Total containers checked: ${discoveredAdsResult.debug.totalContainers}`);
+            console.log(`   Potential ad containers: ${discoveredAdsResult.debug.potentialAdContainers}`);
+            
+            // Log first 3 sample extractions
+            console.log('\n🔬 Sample Extractions (first 3 containers):');
+            if (discoveredAdsResult.debug.debugSamples && discoveredAdsResult.debug.debugSamples.length > 0) {
                 discoveredAdsResult.debug.debugSamples.forEach(sample => {
                     console.log(`\n  Container ${sample.index}:`);
                     console.log(`    Advertiser: "${sample.advertiser}"`);
@@ -1172,30 +1606,44 @@ const crawlerOptions = {
             } else {
                 console.log('  No samples available');
             }
-
-            if (discoveredAdsResult.debug) {
-                console.log('\n📊 Rejection Summary:');
-                if (discoveredAdsResult.debug.rejectionReasons && Object.keys(discoveredAdsResult.debug.rejectionReasons).length > 0) {
-                    Object.entries(discoveredAdsResult.debug.rejectionReasons).forEach(([reason, count]) => {
-                        console.log(`  ${reason}: ${count}`);
+            
+            console.log('\n📊 Rejection Summary:');
+            if (discoveredAdsResult.debug.rejectionReasons && Object.keys(discoveredAdsResult.debug.rejectionReasons).length > 0) {
+                Object.entries(discoveredAdsResult.debug.rejectionReasons).forEach(([reason, count]) => {
+                    console.log(`  ${reason}: ${count}`);
+                });
+            } else {
+                console.log('  No rejection data available');
+            }
+            
+            // Log errors if any
+            if (discoveredAdsResult.debug.totalErrors > 0) {
+                console.log(`\n❌ Errors during extraction: ${discoveredAdsResult.debug.totalErrors}`);
+                if (discoveredAdsResult.debug.errors && discoveredAdsResult.debug.errors.length > 0) {
+                    discoveredAdsResult.debug.errors.forEach(err => {
+                        console.log(`  Container ${err.index}: ${err.message}`);
                     });
-                } else {
-                    console.log('  No rejection data available');
-                }
-
-                // Log errors if any
-                if (discoveredAdsResult.debug.totalErrors > 0) {
-                    console.log(`\n❌ Errors during extraction: ${discoveredAdsResult.debug.totalErrors}`);
-                    if (discoveredAdsResult.debug.errors && discoveredAdsResult.debug.errors.length > 0) {
-                        discoveredAdsResult.debug.errors.forEach(err => {
-                            console.log(`  Container ${err.index}: ${err.message}`);
-                        });
-                    }
                 }
             }
             
             const discoveredAds = discoveredAdsResult.ads;
             console.log(`\n🎯 Discovered ${discoveredAds.length} ads from "${displayName}"`);
+            
+            // ✅ Валидация: сравниваем с ожидаемым количеством
+            if (expectedAdsCount) {
+                const coverage = Math.round((discoveredAds.length / expectedAdsCount) * 100);
+                console.log(`📊 Coverage: ${discoveredAds.length} / ~${expectedAdsCount} ads (${coverage}%)`);
+                
+                if (discoveredAds.length < expectedAdsCount * 0.85) {
+                    console.warn(`⚠️ WARNING: Found only ${discoveredAds.length} out of ~${expectedAdsCount} expected ads (${coverage}%)`);
+                    console.warn(`   Possible reasons:`);
+                    console.warn(`   - Insufficient scrolling (try increasing targetScrolls)`);
+                    console.warn(`   - Too strict image filters (check size/pattern filters)`);
+                    console.warn(`   - Some ads failed validation (check rejection reasons above)`);
+                } else {
+                    console.log(`✅ Good coverage! Found ${coverage}% of expected ads`);
+                }
+            }
             
             if (discoveredAds.length > 0) {
                 // Log discovered competitors
@@ -1380,27 +1828,127 @@ const crawler = new PuppeteerCrawler(crawlerOptions);
 
 async function autoScroll(page, maxScrolls = 15) {
     try {
-        await page.evaluate(async (scrollCount) => {
-            await new Promise((resolve) => {
-                let totalHeight = 0;
-                const distance = 500;
-                let scrolls = 0;
+        const { KeyValueStore } = await import('apify');
+        console.log(`📜 Starting scroll: will perform ${maxScrolls} scrolls (6 seconds each)`);
+        console.log(`📸 Screenshots will be saved to Key-Value Store`);
+        
+        // ✅ АКТИВИРУЕМ СТРАНИЦУ: кликаем на body для фокуса (обязательно для keyboard events!)
+        console.log(`🖱️  Clicking on page to activate focus...`);
+        await page.click('body');
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Пауза после клика
+        console.log(`✅ Page activated, ready to scroll`);
+        
+        let previousAdCount = 0;
+        let noNewAdsCounter = 0;
+        
+        for (let scrollIndex = 0; scrollIndex < maxScrolls; scrollIndex++) {
+            // 📸 Скриншот ПЕРЕД скроллом
+            try {
+                const screenshot = await page.screenshot({ 
+                    fullPage: false, // Только видимая область (быстрее)
+                    encoding: 'binary'
+                });
                 
-                const timer = setInterval(() => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollBy(0, distance);
-                    totalHeight += distance;
-                    scrolls++;
-
-                    if (totalHeight >= scrollHeight || scrolls >= scrollCount) {
-                        clearInterval(timer);
-                        resolve();
-                    }
-                }, 4000); // Slower scrolling for better content loading
+                // Сохраняем в Apify Key-Value Store
+                await KeyValueStore.setValue(`scroll_${scrollIndex + 1}_before.png`, screenshot, { contentType: 'image/png' });
+                console.log(`📸 Screenshot saved: scroll_${scrollIndex + 1}_before.png`);
+            } catch (screenshotError) {
+                console.log(`⚠️ Screenshot failed: ${screenshotError.message}`);
+            }
+            
+            // 📊 Получаем статистику ДО скролла
+            const beforeScroll = await page.evaluate(() => {
+                return {
+                    oldHeight: document.body.scrollHeight,
+                    oldScroll: window.scrollY,
+                    adCards: Array.from(document.querySelectorAll('div')).filter(div => {
+                        const text = div.textContent || '';
+                        return text.includes('Sponsored') && 
+                               text.includes('Started running') &&
+                               div.querySelector('img') &&
+                               text.length > 100;
+                    }).length
+                };
             });
-        }, maxScrolls);
+            
+            console.log(`[Before] scrollY=${beforeScroll.oldScroll}, height=${beforeScroll.oldHeight}, cards=${beforeScroll.adCards}`);
+            
+            // ✅ СКРОЛЛИМ ЧЕРЕЗ KEYBOARD (обходит детекцию ботов!)
+            // Симулируем реального пользователя нажимающего Page Down
+            await page.keyboard.press('PageDown');
+            await new Promise(resolve => setTimeout(resolve, 500)); // Пауза после нажатия
+            
+            // 📊 Получаем статистику ПОСЛЕ скролла
+            const scrollResult = await page.evaluate(() => {
+                const newHeight = document.body.scrollHeight;
+                const newScroll = window.scrollY;
+                
+                const adCards = Array.from(document.querySelectorAll('div')).filter(div => {
+                    const text = div.textContent || '';
+                    return text.includes('Sponsored') && 
+                           text.includes('Started running') &&
+                           div.querySelector('img') &&
+                           text.length > 100;
+                }).length;
+                
+                return {
+                    oldHeight: null, // Заполним из beforeScroll
+                    newHeight,
+                    oldScroll: null, // Заполним из beforeScroll
+                    newScroll,
+                    currentAdCount: adCards
+                };
+            });
+            
+            // Копируем значения из beforeScroll
+            scrollResult.oldHeight = beforeScroll.oldHeight;
+            scrollResult.oldScroll = beforeScroll.oldScroll;
+            
+            console.log(`[After] scrollY=${scrollResult.newScroll}, height=${scrollResult.newHeight}, cards=${scrollResult.currentAdCount}`);
+            
+            const newAdsFound = scrollResult.currentAdCount - previousAdCount;
+            
+            console.log(`📜 Scroll ${scrollIndex + 1}/${maxScrolls}: ${scrollResult.oldHeight}px → ${scrollResult.newHeight}px | Scroll: ${scrollResult.oldScroll}px → ${scrollResult.newScroll}px | Ad cards found: ${scrollResult.currentAdCount} (+${newAdsFound})`);
+            
+            // Проверяем, загружается ли новый контент
+            if (newAdsFound === 0) {
+                noNewAdsCounter++;
+            } else {
+                noNewAdsCounter = 0;
+            }
+            previousAdCount = scrollResult.currentAdCount;
+            
+            // ✅ Завершаем если 5 скроллов подряд без новых объявлений (увеличено с 3 до 5)
+            if (noNewAdsCounter >= 5) {
+                console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads loaded for 5 consecutive scrolls)`);
+                console.log(`   Final stats: height ${scrollResult.newHeight}px, Ad cards found: ${scrollResult.currentAdCount}`);
+                break;
+            }
+            
+            // Пауза между скроллами для загрузки lazy-loaded контента
+            await new Promise(resolve => setTimeout(resolve, 6000));
+        }
+        
+        // 📸 Финальный скриншот
+        try {
+            const { KeyValueStore } = await import('apify');
+            const finalScreenshot = await page.screenshot({ 
+                fullPage: false,
+                encoding: 'binary'
+            });
+            await KeyValueStore.setValue('scroll_final.png', finalScreenshot, { contentType: 'image/png' });
+            console.log(`📸 Final screenshot saved: scroll_final.png`);
+        } catch (screenshotError) {
+            console.log(`⚠️ Final screenshot failed: ${screenshotError.message}`);
+        }
+        
+        // ✅ Дополнительная пауза после всех скроллов
+        console.log('⏳ Waiting additional 10 seconds for final content to load...');
+        await new Promise(resolve => setTimeout(resolve, 10000));
+        console.log('✅ Final wait complete');
+        
     } catch (error) {
-        console.log('Scroll failed:', error.message);
+        console.error('❌ Error during scrolling:', error.message);
     }
 }
 
@@ -2065,24 +2613,406 @@ async function matchAdsToOrganicPosts(ads, organicPosts) {
     return ads;
 }
 
+// Supabase Integration - DELETE old data and save FRESH creatives
+// This ensures the external service always gets the latest data
+async function saveToSupabase(ads, supabaseUrl, supabaseKey) {
+    try {
+        console.log('💾 Starting Supabase integration...');
+        console.log(`🔍 DEBUG: Received ${ads?.length || 0} ads`);
+        console.log(`🔍 DEBUG: supabaseUrl = ${supabaseUrl ? 'PROVIDED' : 'MISSING'}`);
+        console.log(`🔍 DEBUG: supabaseKey = ${supabaseKey ? 'PROVIDED (length: ' + supabaseKey.length + ')' : 'MISSING'}`);
+        
+        if (!supabaseUrl || !supabaseKey) {
+            console.log('⚠️ Supabase credentials not provided. Skipping Supabase storage.');
+            return false;
+        }
+
+        // Initialize Supabase client
+        console.log('🔌 Initializing Supabase client...');
+        const supabase = createClient(supabaseUrl, supabaseKey);
+        console.log('✅ Supabase client created');
+        
+        // Save ALL ads to Supabase (no filtering)
+        console.log('🔍 Processing all ads for Supabase (no active days filter)...');
+        const targetAds = ads; // Save everything
+        
+        console.log(`📊 Saving ${targetAds.length} creatives to Supabase (all ads, no filter)`);
+        
+        // DEBUG: Show sample ad data
+        if (targetAds.length > 0) {
+            const sampleAd = targetAds[0];
+            console.log(`🔍 DEBUG: Sample ad data:`);
+            console.log(`  - adId: ${sampleAd.adId || 'N/A'}`);
+            console.log(`  - competitorName: ${sampleAd.competitorName || 'N/A'}`);
+            console.log(`  - activeDays: ${sampleAd.activeDays || 'N/A'}`);
+            console.log(`  - imageUrl: ${sampleAd.imageUrl ? 'EXISTS' : 'N/A'}`);
+            console.log(`  - allImageUrls: ${sampleAd.allImageUrls?.length || 0} images`);
+            if (sampleAd.allImageUrls?.length > 0) {
+                console.log(`  - First image URL: ${sampleAd.allImageUrls[0]?.substring(0, 100)}...`);
+            }
+        }
+        
+        // Count ads with/without images
+        const adsWithImages = targetAds.filter(ad => 
+            (Array.isArray(ad.allImageUrls) && ad.allImageUrls.length > 0) || ad.imageUrl
+        ).length;
+        const adsWithoutImages = targetAds.length - adsWithImages;
+        console.log(`📊 Image stats: ✅ ${adsWithImages} with images, ⚠️ ${adsWithoutImages} without images`);
+        
+        if (adsWithoutImages > 0 && targetAds.length > 0) {
+            console.log(`⚠️ WARNING: ${adsWithoutImages} ads have NO images - they might be filtered out or not scraped properly`);
+        }
+        
+        if (targetAds.length === 0) {
+            console.log('ℹ️ No creatives found. Skipping Supabase upload.');
+            return true;
+        }
+        
+        // Ensure storage bucket exists
+        const bucketName = 'competitor-creatives';
+        console.log(`📦 Checking storage bucket: ${bucketName}`);
+        
+        const { data: buckets } = await supabase.storage.listBuckets();
+        const bucketExists = buckets?.some(b => b.name === bucketName);
+        
+        if (!bucketExists) {
+            console.log(`📦 Creating storage bucket: ${bucketName}`);
+            await supabase.storage.createBucket(bucketName, {
+                public: true,
+                fileSizeLimit: 10485760 // 10MB
+            });
+        }
+        
+        // ═══════════════════════════════════════════════════════
+        // 🗑️ STEP 1: Delete all old data (fresh start every run)
+        // ═══════════════════════════════════════════════════════
+        console.log('\n🗑️ Cleaning old data from Supabase...');
+        
+        // Delete all records from database table
+        try {
+            console.log('🗑️ Deleting all records from competitor_creatives table...');
+            const { error: deleteError } = await supabase
+                .from('competitor_creatives')
+                .delete()
+                .neq('ad_id', ''); // Delete all records (where ad_id is not empty, which is all)
+            
+            if (deleteError) {
+                console.warn(`⚠️ Error deleting table records: ${deleteError.message}`);
+            } else {
+                console.log('✅ All old records deleted from database');
+            }
+        } catch (err) {
+            console.warn(`⚠️ Failed to delete old table records: ${err.message}`);
+        }
+        
+        // Delete all files from storage bucket
+        try {
+            console.log('🗑️ Deleting all old images from storage...');
+            
+            // List all files in bucket
+            const { data: filesList, error: listError } = await supabase.storage
+                .from(bucketName)
+                .list('', {
+                    limit: 1000,
+                    offset: 0
+                });
+            
+            if (listError) {
+                console.warn(`⚠️ Error listing files: ${listError.message}`);
+            } else if (filesList && filesList.length > 0) {
+                console.log(`📋 Found ${filesList.length} folders in storage, scanning for files...`);
+                
+                let totalDeleted = 0;
+                
+                // Delete files in each folder
+                for (const folder of filesList) {
+                    if (folder.name) {
+                        const { data: folderFiles } = await supabase.storage
+                            .from(bucketName)
+                            .list(folder.name, { limit: 1000 });
+                        
+                        if (folderFiles && folderFiles.length > 0) {
+                            const filePaths = folderFiles.map(f => `${folder.name}/${f.name}`);
+                            
+                            const { error: removeError } = await supabase.storage
+                                .from(bucketName)
+                                .remove(filePaths);
+                            
+                            if (!removeError) {
+                                totalDeleted += filePaths.length;
+                                console.log(`✅ Deleted ${filePaths.length} files from ${folder.name}`);
+                            }
+                        }
+                    }
+                }
+                
+                console.log(`✅ Total deleted: ${totalDeleted} old images from storage`);
+            } else {
+                console.log('ℹ️ No old files found in storage (clean bucket)');
+            }
+        } catch (err) {
+            console.warn(`⚠️ Failed to delete old storage files: ${err.message}`);
+        }
+        
+        console.log('✅ Cleanup complete! Ready to upload fresh data\n');
+        // ═══════════════════════════════════════════════════════
+        
+        // Download and upload images to Supabase Storage
+        console.log(`🖼️ Downloading and uploading ${targetAds.length} NEW images to Supabase Storage...`);
+        
+        const creativesToSave = [];
+        let successCount = 0;
+        let failCount = 0;
+        let processedCount = 0;
+        
+        for (const ad of targetAds) {
+            try {
+                // Calculate launch date (today - active days)
+                const launchDate = new Date();
+                launchDate.setDate(launchDate.getDate() - (ad.activeDays || 0));
+                
+                // Get first image URL
+                const originalImageUrl = Array.isArray(ad.allImageUrls) && ad.allImageUrls.length > 0 
+                    ? ad.allImageUrls[0] 
+                    : (ad.imageUrl || '');
+                
+                if (processedCount < 5) { // Debug first 5 ads
+                    console.log(`🔍 DEBUG: Processing ad #${processedCount + 1}: ${ad.adId || 'unknown'}`);
+                    console.log(`  - allImageUrls: ${ad.allImageUrls?.length || 0} images`);
+                    console.log(`  - imageUrl: ${ad.imageUrl ? 'EXISTS' : 'N/A'}`);
+                    console.log(`  - Original image URL: ${originalImageUrl ? originalImageUrl.substring(0, 100) + '...' : 'EMPTY ⚠️'}`);
+                }
+                
+                let storedImageUrl = originalImageUrl || null; // null if no image
+                processedCount++;
+                
+                // Download and upload image if URL exists
+                if (originalImageUrl && originalImageUrl.startsWith('http')) {
+                    try {
+                        console.log(`📥 Downloading image for ${ad.adId}...`);
+                        // Download image
+                        const response = await fetch(originalImageUrl);
+                        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                        
+                        const arrayBuffer = await response.arrayBuffer();
+                        const buffer = Buffer.from(arrayBuffer);
+                        console.log(`✅ Downloaded ${buffer.length} bytes`);
+                        
+                        // Generate unique filename
+                        const adId = ad.adId || ad.libraryId || `unknown_${Date.now()}`;
+                        const ext = originalImageUrl.match(/\.(jpg|jpeg|png|webp|gif)($|\?)/i)?.[1] || 'jpg';
+                        const fileName = `${adId.replace(/[^a-zA-Z0-9]/g, '_')}_${Date.now()}.${ext}`;
+                        const filePath = `${ad.competitorName || 'unknown'}/${fileName}`;
+                        
+                        console.log(`📤 Uploading to Supabase: ${filePath}`);
+                        
+                        // Upload to Supabase Storage
+                        const { data: uploadData, error: uploadError } = await supabase.storage
+                            .from(bucketName)
+                            .upload(filePath, buffer, {
+                                contentType: `image/${ext}`,
+                                upsert: true
+                            });
+                        
+                        console.log(`🔍 DEBUG: Upload result - error: ${uploadError ? uploadError.message : 'none'}, data: ${uploadData ? 'exists' : 'null'}`);
+                        
+                        if (uploadError) {
+                            console.warn(`⚠️ Failed to upload image for ${adId}:`, uploadError.message);
+                        } else {
+                            // Get public URL
+                            const { data: urlData } = supabase.storage
+                                .from(bucketName)
+                                .getPublicUrl(filePath);
+                            
+                            storedImageUrl = urlData.publicUrl;
+                            successCount++;
+                            console.log(`✅ Uploaded: ${adId} → ${fileName}`);
+                        }
+                    } catch (imgError) {
+                        console.warn(`⚠️ Failed to download/upload image for ${ad.adId}:`, imgError.message);
+                        failCount++;
+                        // Keep original URL as fallback
+                    }
+                }
+                
+                // Минимальная структура для второго агента (только 4 поля)
+                // Пропускаем записи без image_url (обязательное поле)
+                if (storedImageUrl) {
+                    creativesToSave.push({
+                        image_url: storedImageUrl,                                    // ОБЯЗАТЕЛЬНО: ссылка на превью
+                        competitor_name: ad.competitorName || ad.searchTerm || 'Unknown',  // Название конкурента
+                        active_days: ad.activeDays || 0,                             // Количество дней (INTEGER)
+                        ad_id: ad.adId || ad.libraryId || null                       // ID креатива (уникальный идентификатор)
+                    });
+                } else {
+                    // 📊 ДЕТАЛЬНОЕ ЛОГИРОВАНИЕ ПРОПУЩЕННЫХ КРЕАТИВОВ
+                    console.warn(`⚠️ [SKIPPED] Ad ${ad.adId || 'unknown'}: NO IMAGE URL`);
+                    console.warn(`   → allImageUrls: ${ad.allImageUrls?.length || 0} images`);
+                    console.warn(`   → imageUrl: ${ad.imageUrl || 'N/A'}`);
+                    console.warn(`   → originalImageUrl: ${originalImageUrl || 'N/A'}`);
+                    console.warn(`   → storedImageUrl: ${storedImageUrl || 'N/A'}`);
+                    if (ad.allImageUrls && ad.allImageUrls.length > 0) {
+                        console.warn(`   → First image sample: ${ad.allImageUrls[0]?.substring(0, 100)}...`);
+                    }
+                }
+                
+                // Update original ad object with Supabase URL
+                if (storedImageUrl && storedImageUrl !== originalImageUrl) {
+                    ad.supabaseImageUrl = storedImageUrl;
+                    if (ad.allImageUrls && ad.allImageUrls.length > 0) {
+                        ad.allImageUrls[0] = storedImageUrl; // Replace first image with Supabase URL
+                    }
+                }
+                
+            } catch (adError) {
+                console.error(`❌ Error processing ad ${ad.adId}:`, adError.message);
+                failCount++;
+            }
+        }
+        
+        console.log(`📊 Image upload stats: ✅ ${successCount} success, ⚠️ ${failCount} failed`);
+        
+        // Дедупликация перед сохранением (убираем дубликаты)
+        console.log(`🔍 Removing duplicates from ${creativesToSave.length} records...`);
+        const uniqueCreatives = [];
+        const seenIds = new Set();
+        const seenImageUrls = new Set();
+        const seenCombinations = new Set(); // Для креативов без ad_id
+        let duplicatesRemoved = 0;
+        
+        for (const creative of creativesToSave) {
+            // 1. Проверяем по ad_id (приоритет) - самый надежный способ
+            if (creative.ad_id) {
+                if (seenIds.has(creative.ad_id)) {
+                    duplicatesRemoved++;
+                    continue;
+                }
+                seenIds.add(creative.ad_id);
+                uniqueCreatives.push(creative);
+                continue;
+            }
+            
+            // 2. Проверяем по image_url (fallback для креативов без ad_id)
+            if (creative.image_url) {
+                if (seenImageUrls.has(creative.image_url)) {
+                    duplicatesRemoved++;
+                    continue;
+                }
+                seenImageUrls.add(creative.image_url);
+            }
+            
+            // 3. Для креативов без ad_id и image_url используем комбинацию полей
+            const combination = `${creative.competitor_name}_${creative.image_url?.substring(0, 50) || 'no_image'}_${creative.active_days}`;
+            if (seenCombinations.has(combination)) {
+                duplicatesRemoved++;
+                continue;
+            }
+            seenCombinations.add(combination);
+            
+            // Добавляем в уникальные
+            uniqueCreatives.push(creative);
+        }
+        
+        console.log(`✅ Removed ${duplicatesRemoved} duplicates. Unique creatives: ${uniqueCreatives.length}`);
+        
+        // Insert fresh data into Supabase table (no duplicates since we cleaned everything)
+        // Сохраняем только минимальную структуру (4 поля) для второго агента
+        console.log(`💾 Inserting ${uniqueCreatives.length} NEW records to database (minimal structure: 4 fields)...`);
+        
+        if (uniqueCreatives.length === 0) {
+            console.log('⚠️ No creatives to save (all skipped due to missing image_url or duplicates)');
+            return true;
+        }
+        
+        const { data, error } = await supabase
+            .from('competitor_creatives')
+            .insert(uniqueCreatives)
+            .select();
+        
+        if (error) {
+            console.error('❌ Supabase database error:', error.message);
+            return false;
+        }
+        
+        console.log(`✅ Successfully saved ${data?.length || creativesToSave.length} creatives to Supabase!`);
+        console.log(`📊 Table: competitor_creatives`);
+        console.log(`📋 Structure: image_url, competitor_name, active_days, ad_id (4 fields only)`);
+        console.log(`🖼️ Storage: ${bucketName}`);
+        console.log(`🔗 URL: ${supabaseUrl}`);
+        console.log(`🔄 Updated ${successCount} ad objects with Supabase URLs for Google Sheets export`);
+        
+        return true;
+    } catch (error) {
+        console.error('❌ Error during Supabase upload:', error.message);
+        return false;
+    }
+}
+
 // Google Sheets Integration - Export each competitor to separate sheet
+/**
+ * Load Google Service Account credentials from multiple sources
+ * Priority: 1) Input parameter, 2) Environment variables, 3) service-account.json file
+ */
+function loadGoogleServiceAccountCredentials(inputKey) {
+    // 1. Try input parameter first
+    if (inputKey) {
+        try {
+            const parsed = typeof inputKey === 'string' ? JSON.parse(inputKey) : inputKey;
+            if (parsed.type === 'service_account') {
+                console.log('✅ Using Google credentials from input parameter');
+                return parsed;
+            }
+        } catch (e) {
+            // Not valid JSON, continue
+        }
+    }
+    
+    // 2. Try environment variables
+    if (process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL && process.env.GOOGLE_PRIVATE_KEY) {
+        console.log('✅ Using Google credentials from environment variables');
+        return {
+            type: 'service_account',
+            project_id: process.env.GOOGLE_PROJECT_ID || '',
+            private_key_id: process.env.GOOGLE_PRIVATE_KEY_ID || '',
+            private_key: process.env.GOOGLE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+            client_email: process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL,
+            client_id: process.env.GOOGLE_CLIENT_ID || '',
+            auth_uri: 'https://accounts.google.com/o/oauth2/auth',
+            token_uri: 'https://oauth2.googleapis.com/token',
+            auth_provider_x509_cert_url: 'https://www.googleapis.com/oauth2/v1/certs',
+            client_x509_cert_url: `https://www.googleapis.com/robot/v1/metadata/x509/${encodeURIComponent(process.env.GOOGLE_SERVICE_ACCOUNT_EMAIL)}`,
+            universe_domain: 'googleapis.com'
+        };
+    }
+    
+    // 3. Try service-account.json file
+    try {
+        const __filename = fileURLToPath(import.meta.url);
+        const __dirname = dirname(__filename);
+        const credsPath = join(__dirname, '..', 'service-account.json');
+        const credsContent = readFileSync(credsPath, 'utf8');
+        const credentials = JSON.parse(credsContent);
+        if (credentials.type === 'service_account') {
+            console.log('✅ Using Google credentials from service-account.json file');
+            return credentials;
+        }
+    } catch (e) {
+        // File not found or invalid, continue
+    }
+    
+    return null;
+}
+
 async function exportToGoogleSheetsByCompetitor(adsByCompetitor, spreadsheetId, serviceAccountKey) {
     try {
         console.log('📊 Starting export to Google Sheets (separate sheets per competitor)...');
         
-        if (!serviceAccountKey || !spreadsheetId) {
+        // Load credentials from multiple sources
+        const credentials = loadGoogleServiceAccountCredentials(serviceAccountKey);
+        
+        if (!credentials || !spreadsheetId) {
             console.log('⚠️ Google Sheets credentials not provided. Skipping export.');
-            return false;
-        }
-
-        // Parse service account key
-        let credentials;
-        try {
-            credentials = typeof serviceAccountKey === 'string' 
-                ? JSON.parse(serviceAccountKey) 
-                : serviceAccountKey;
-        } catch (e) {
-            console.error('❌ Invalid Service Account JSON:', e.message);
+            console.log('💡 Tip: Set credentials via input, .env file, or service-account.json');
             return false;
         }
 
@@ -2556,6 +3486,67 @@ await crawler.run();
 
 console.log('🎉 Competitor ads collection completed!');
 console.log('📊 Collected all active ads from specified competitors');
+
+// Save to Supabase if enabled (deletes old data and inserts fresh creatives)
+console.log('🔍 DEBUG: Checking enableSupabase flag:', enableSupabase);
+if (enableSupabase) {
+    console.log('💾 Preparing to save creatives to Supabase...');
+    console.log('🔍 DEBUG: enableSupabase = true');
+    console.log('🔍 DEBUG: supabaseUrl =', supabaseUrl);
+    console.log('🔍 DEBUG: supabaseKey length =', supabaseKey ? supabaseKey.length : 0);
+    
+    try {
+        // Get all data from the dataset
+        const dataset = await Actor.openDataset();
+        const { items } = await dataset.getData();
+        
+        console.log(`🔍 DEBUG: Retrieved ${items.length} items from dataset`);
+        
+        // Filter out error entries
+        const validAds = items.filter(item => !item.error && item.advertiserName);
+        
+        console.log(`🔍 DEBUG: Filtered to ${validAds.length} valid ads`);
+        
+        if (validAds.length > 0) {
+            console.log(`📋 Processing ${validAds.length} ads for Supabase (all ads, no filter)...`);
+            
+            // Save to Supabase
+            console.log('🔍 DEBUG: Calling saveToSupabase function...');
+            const supabaseSuccess = await saveToSupabase(
+                validAds,
+                supabaseUrl,
+                supabaseKey
+            );
+            
+            if (supabaseSuccess) {
+                console.log('✅ Creatives successfully saved to Supabase!');
+                
+                // Update dataset with Supabase URLs for Google Sheets export
+                console.log('🔄 Updating Apify Dataset with Supabase image URLs...');
+                try {
+                    // Get error entries to preserve them
+                    const errorEntries = items.filter(item => item.error || !item.advertiserName);
+                    
+                    // Clear and re-save with updated URLs
+                    await dataset.drop();
+                    await Actor.pushData([...validAds, ...errorEntries]);
+                    console.log(`✅ Dataset updated: ${validAds.length} ads with Supabase URLs + ${errorEntries.length} error entries`);
+                } catch (updateError) {
+                    console.warn('⚠️ Failed to update dataset:', updateError.message);
+                }
+            } else {
+                console.log('⚠️ Supabase save failed. Data is still in Apify Dataset.');
+            }
+        } else {
+            console.log('⚠️ No valid ads found to save to Supabase');
+        }
+    } catch (error) {
+        console.error('❌ Error during Supabase save:', error.message);
+        console.log('💾 Data is still available in Apify Dataset');
+    }
+} else {
+    console.log('ℹ️ Supabase storage is disabled. Enable it in input settings to save creatives.');
+}
 
 // Export to Google Sheets if enabled
 if (enableGoogleSheets) {
