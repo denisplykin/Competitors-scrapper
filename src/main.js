@@ -1957,6 +1957,7 @@ async function autoScroll(page, maxScrolls = 15) {
                 noNewAdsCounter = 0; // Reset counter after clicking button
             } else {
                 if (newAdsFound === 0 && scrollResult.newScroll === beforeScroll.oldScroll) {
+                 if (newAdsFound === 0) {
                     noNewAdsCounter++;
                 } else {
                     noNewAdsCounter = 0;
@@ -1971,6 +1972,12 @@ async function autoScroll(page, maxScrolls = 15) {
             }
 
             await new Promise(resolve => setTimeout(resolve, 4000));
+            if (noNewAdsCounter >= 5) {
+                console.log(`✅ Scrolling complete after ${scrollIndex + 1} scrolls (no new ads for 5 consecutive scrolls)`);
+                break;
+            }
+
+            await new Promise(resolve => setTimeout(resolve, 6000));
         }
 
         console.log('⏳ Waiting additional 10 seconds for final content to load...');
