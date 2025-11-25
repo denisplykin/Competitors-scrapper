@@ -8,10 +8,11 @@
         "node": ">=18.0.0"
     },
     "dependencies": {
+        "@supabase/supabase-js": "^2.84.0",
         "apify": "^3.4.2",
         "crawlee": "^3.5.0",
-        "puppeteer": "24.12.1",
-        "googleapis": "^128.0.0"
+        "googleapis": "^128.0.0",
+        "puppeteer": "24.12.1"
     },
     "scripts": {
         "start": "node ./src/main.js"
